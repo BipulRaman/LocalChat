@@ -800,9 +800,10 @@ function renderTicks(state) {
       html: `<svg viewBox="0 0 16 12" width="15" height="12"><path d="M1 6.5l4 4L13 1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
     });
   }
+  // Double tick: two checkmarks with the second overlapping slightly to the right (WhatsApp style).
   return el("span", {
     class: cls,
-    html: `<svg viewBox="0 0 20 12" width="18" height="12"><path d="M1 6.5l4 4L13 1.5M7 10.5l4-4M11 6.5L19 1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    html: `<svg viewBox="0 0 22 12" width="20" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 6.5l4 4L13 1.5"/><path d="M9 10.5l4-4M13 6.5L21 1.5"/></svg>`,
   });
 }
 

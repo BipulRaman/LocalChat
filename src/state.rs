@@ -10,7 +10,7 @@ use crate::channel::ChannelRegistry;
 use crate::config::Config;
 use crate::message::ChannelId;
 use crate::metrics::Metrics;
-use crate::persist::HistoryStore;
+use crate::persist::{HistoryStore, ReactionLog};
 use crate::user::{UserId, UserInfo};
 
 pub type ReactionKey = (ChannelId, u64);
@@ -30,8 +30,9 @@ pub struct AppState {
     pub metrics: Metrics,
 
     /// Per-message reactions: (channel, msgId) -> emoji -> users that reacted.
-    /// In-memory only; lost on restart.
+    /// Backed by `reaction_log` (append-only JSONL), replayed on startup.
     pub reactions: DashMap<ReactionKey, DashMap<EmojiKey, Vec<UserId>>>,
+    pub reaction_log: ReactionLog,
 
     pub next_user_id: AtomicU32,
     pub next_msg_id: AtomicU64,
@@ -64,6 +65,9 @@ impl AppState {
             app_root.display()
         ));
 
+        let reaction_log = ReactionLog::new(&app_root);
+        let prior_reactions = reaction_log.load_all().await;
+
         let state = Arc::new(Self {
             app_root,
             uploads_dir,
@@ -76,9 +80,38 @@ impl AppState {
             history: HistoryStore::new(history_dir, rotate_mb),
             metrics: Metrics::default(),
             reactions: DashMap::new(),
+            reaction_log,
             next_user_id: AtomicU32::new(1),
             next_msg_id: AtomicU64::new(1),
         });
+
+        // Replay reaction events into the in-memory map.
+        for ev in prior_reactions {
+            let key = (
+                compact_str::CompactString::from(ev.c.as_str()),
+                ev.m,
+            );
+            let entry = state.reactions.entry(key.clone()).or_default();
+            let mut users = entry.entry(
+                compact_str::CompactString::from(ev.e.as_str()),
+            ).or_default();
+            let pos = users.iter().position(|u| *u == ev.u);
+            if ev.on {
+                if pos.is_none() { users.push(ev.u); }
+            } else if let Some(p) = pos {
+                users.swap_remove(p);
+            }
+            let emoji_empty = users.is_empty();
+            drop(users);
+            if emoji_empty {
+                entry.remove(&compact_str::CompactString::from(ev.e.as_str()));
+            }
+            let entry_empty = entry.is_empty();
+            drop(entry);
+            if entry_empty {
+                state.reactions.remove(&key);
+            }
+        }
 
         // Warm lobby history from disk so rejoins see prior messages.
         if let Some(lobby) = state.channels.get(crate::channel::LOBBY_ID) {

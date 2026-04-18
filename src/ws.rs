@@ -644,6 +644,15 @@ async fn handle_op(
                 state.reactions.remove(&(channel_id.clone(), msg_id));
             }
 
+            // Persist the toggle event so reactions survive restart.
+            state.reaction_log.append(&crate::persist::ReactionEvent {
+                c: channel_id.to_string(),
+                m: msg_id,
+                u: user_id,
+                e: emoji.to_string(),
+                on,
+            }).await;
+
             let username = state
                 .users
                 .get(&user_id)

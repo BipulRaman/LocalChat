@@ -102,3 +102,61 @@ impl HistoryStore {
         &self.root
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Reactions append-only log
+// ──────────────────────────────────────────────────────────────────────
+
+/// One reaction toggle event written to `reactions.jsonl` in app_root.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ReactionEvent {
+    pub c: String,    // channel id
+    pub m: u64,       // message id
+    pub u: u32,       // user id
+    pub e: String,    // emoji
+    pub on: bool,     // true=added, false=removed
+}
+
+pub struct ReactionLog {
+    pub path: PathBuf,
+    pub write_lock: Mutex<()>,
+}
+
+impl ReactionLog {
+    pub fn new(app_root: &Path) -> Self {
+        Self {
+            path: app_root.join("reactions.jsonl"),
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn append(&self, ev: &ReactionEvent) {
+        let _g = self.write_lock.lock().await;
+        let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+        else {
+            return;
+        };
+        let Ok(line) = serde_json::to_vec(ev) else { return };
+        let _ = f.write_all(&line).await;
+        let _ = f.write_all(b"\n").await;
+    }
+
+    pub async fn load_all(&self) -> Vec<ReactionEvent> {
+        let Ok(f) = File::open(&self.path).await else {
+            return Vec::new();
+        };
+        let mut reader = BufReader::new(f).lines();
+        let mut out = Vec::new();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if line.is_empty() { continue; }
+            if let Ok(ev) = serde_json::from_str::<ReactionEvent>(&line) {
+                out.push(ev);
+            }
+        }
+        out
+    }
+}
