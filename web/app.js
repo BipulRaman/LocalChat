@@ -221,6 +221,11 @@ const S = {
 (async function boot() {
   try { await E2EE.init(); } catch (e) { console.warn("E2EE init failed", e); }
 
+  // Refresh speaker/headset icon when audio devices change (plug/unplug).
+  if (navigator.mediaDevices?.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", () => updateSpeakerIcon().catch(() => {}));
+  }
+
   // Track on-screen keyboard (mobile) via visualViewport so the layout
   // shrinks correctly and the emoji popover/composer stay visible.
   if (window.visualViewport) {
@@ -1709,7 +1714,41 @@ async function toggleSpeaker() {
   audio.volume = speakerOn ? 1.0 : 0.35;
   const btn = $("speakerBtn");
   if (btn) btn.classList.toggle("active", speakerOn);
+  await updateSpeakerIcon();
   toast(speakerOn ? "Speaker on" : "Speaker off");
+}
+
+// Swap the speaker button's icon to a headset glyph if a headset/Bluetooth
+// audio output device is detected (or currently selected).
+const SVG_SPEAKER  = `<path d="M3 10v4a1 1 0 001 1h3l5 4V5L7 9H4a1 1 0 00-1 1z"/><path d="M16 8a5 5 0 010 8M19 5a9 9 0 010 14"/>`;
+const SVG_HEADSET  = `<path d="M4 14v-2a8 8 0 0116 0v2"/><rect x="2" y="14" width="5" height="7" rx="1.5"/><rect x="17" y="14" width="5" height="7" rx="1.5"/>`;
+const SVG_BLUETOOTH= `<path d="M7 7l10 10-5 5V2l5 5L7 17"/>`;
+
+async function updateSpeakerIcon() {
+  const icon = document.getElementById("speakerIcon");
+  if (!icon) return;
+  let kind = "speaker";
+  // If user explicitly switched to loudspeaker, always show speaker icon.
+  if (Call._speakerState) {
+    kind = "speaker";
+  } else {
+    try {
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        const outs = devs.filter((d) => d.kind === "audiooutput");
+        const text = outs.map((d) => (d.label || "").toLowerCase()).join(" | ");
+        if (/bluetooth|airpods|buds/.test(text)) kind = "bluetooth";
+        else if (/head(set|phone)|earphone|earbud|earpiece/.test(text)) kind = "headset";
+      }
+    } catch {}
+  }
+  const svg = kind === "bluetooth" ? SVG_BLUETOOTH : kind === "headset" ? SVG_HEADSET : SVG_SPEAKER;
+  if (icon.dataset.kind !== kind) {
+    icon.innerHTML = svg;
+    icon.dataset.kind = kind;
+  }
+  const btn = $("speakerBtn");
+  if (btn) btn.title = kind === "bluetooth" ? "Bluetooth audio" : kind === "headset" ? "Headset" : "Speaker";
 }
 
 async function toggleCamera() {
@@ -1808,6 +1847,7 @@ function showCallBar(status) {
   }
   setCallStatus(status);
   bar.classList.remove("hidden");
+  updateSpeakerIcon();
 }
 
 function setCallStatus(s) {
