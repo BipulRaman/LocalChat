@@ -38,10 +38,14 @@ pub async fn serve(
         let requested = if cfg.port > 0 { Some(cfg.port) } else { None };
         crate::net::pick_port(requested)?
     };
+    state
+        .bound_port
+        .store(port, std::sync::atomic::Ordering::Relaxed);
 
     let app = Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/api/info", get(info))
+        .route("/api/share", get(share))
         .route("/api/upload", post(upload))
         .route("/api/download/:filename", get(download))
         .route("/uploads/:filename", get(serve_upload))
@@ -51,8 +55,8 @@ pub async fn serve(
 
     let _ = ready.send(port);
 
-    // Serve everything over HTTPS on the chosen port (default 5000) so
-    // browsers grant getUserMedia / Web Crypto on LAN. A self-signed cert
+    // Serve everything over HTTPS on the chosen port (443 preferred, else
+    // first free port in the preferred list) so browsers grant getUserMedia / Web Crypto on LAN. A self-signed cert
     // is auto-generated under <app_root>/tls/ on first run.
     serve_tls(state, app, port).await
 }
@@ -123,6 +127,57 @@ async fn info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "uploads_dir": state.uploads_dir.display().to_string(),
         "logs_dir": state.logs_dir.display().to_string(),
     }))
+}
+
+/// Public share info: the URLs this server is reachable at, plus
+/// pre-rendered SVG QR codes. No auth — these are addresses any joined
+/// user already knows (they're connected to one of them).
+async fn share(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let port = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            let p = state.bound_port.load(std::sync::atomic::Ordering::Relaxed);
+            if p > 0 { p } else {
+                let cfg = state.config.read().unwrap();
+                if cfg.port > 0 { cfg.port } else { 443 }
+            }
+        });
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut push = |label: &str, url: String| -> Option<serde_json::Value> {
+        if !seen.insert(url.clone()) { return None; }
+        Some(json!({ "label": label, "url": url.clone(), "qr": render_qr_svg(&url) }))
+    };
+
+    // Only expose true LAN addresses (192.168.x.x). Skips localhost and
+    // virtual adapters like 172.x (Hyper-V / WSL) that other phones can't
+    // route to anyway.
+    for ip in crate::net::lan_addresses() {
+        if ip.starts_with("192.168.") {
+            if let Some(v) = push("LAN", format!("https://{ip}:{port}")) { entries.push(v); }
+        }
+    }
+
+    Json(json!({ "entries": entries }))
+}
+
+fn render_qr_svg(data: &str) -> String {
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+    match QrCode::with_error_correction_level(data.as_bytes(), EcLevel::M) {
+        Ok(code) => code
+            .render::<svg::Color<'_>>()
+            .min_dimensions(220, 220)
+            .quiet_zone(true)
+            .dark_color(svg::Color("#0f172a"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+        Err(_) => String::new(),
+    }
 }
 
 fn hostname() -> String {

@@ -811,7 +811,7 @@ function renderEmptyState(ch) {
     ? "Messages here are end-to-end encrypted. The server admin cannot read them."
     : "Say hi or share a file. Messages stay on this local network.";
   return el("div", { class: "stream-empty" }, [
-    el("div", { class: "brand-mark", html: `<svg viewBox="0 0 32 32" width="56" height="56"><rect width="32" height="32" rx="8" fill="#6366f1"/><path d="M10 10h3v10h7v3H10z" fill="white"/></svg>` }),
+    el("div", { class: "brand-mark", html: `<svg viewBox="0 0 32 32" width="56" height="56"><defs><linearGradient id="lcEmpty" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#lcEmpty)"/><path d="M8 10a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-5l-4 3v-3h-1a3 3 0 0 1-3-3z" fill="white"/><circle cx="13" cy="13.5" r="1.3" fill="#6366f1"/><circle cx="16" cy="13.5" r="1.3" fill="#6366f1"/><circle cx="19" cy="13.5" r="1.3" fill="#6366f1"/></svg>` }),
     el("h3", {}, title),
     el("p", {}, sub),
   ]);
@@ -1063,7 +1063,7 @@ function updateHeader() {
     title.textContent = p ? p.username : "unknown";
     sub.textContent = p ? (p.offline ? "offline" : "online") : "";
     badge.classList.remove("hidden");
-    composer.placeholder = p ? `Encrypted message to ${p.username}\u2026` : "Message\u2026";
+    composer.placeholder = "Type a message";
     if (avSlot) {
       avSlot.style.background = p?.color || "var(--brand)";
       avSlot.textContent = p?.avatar || (p?.username?.[0] || "?").toUpperCase();
@@ -1075,7 +1075,7 @@ function updateHeader() {
     title.textContent = "#" + (ch.name || ch.id);
     sub.textContent = ch.kind === "lobby" ? "lobby \u00b7 everyone" : (ch.isPrivate ? "private channel" : "channel");
     badge.classList.add("hidden");
-    composer.placeholder = `Message #${ch.name || ch.id}\u2026`;
+    composer.placeholder = "Type a message";
     if (avSlot) {
       avSlot.style.background = "var(--brand)";
       avSlot.textContent = "#";
@@ -1280,6 +1280,47 @@ function closeConfirm(result) {
   if (r) r(!!result);
 }
 Object.assign(window, { closeConfirm });
+
+// ─── Share / pair modal ───────────────────────────────────────────────
+async function openShareModal() {
+  const m = $("shareModal");
+  const host = $("shareGridUser");
+  if (!m || !host) return;
+  host.innerHTML = `<p class="muted sm">Loading…</p>`;
+  m.classList.remove("hidden");
+  try {
+    const r = await fetch("/api/share").then((r) => r.json());
+    const entries = r.entries || [];
+    if (!entries.length) { host.innerHTML = `<p class="muted">No reachable addresses detected.</p>`; return; }
+    host.innerHTML = entries.map((e) => `
+      <div class="share-card">
+        <div class="share-qr">${e.qr}</div>
+        <div class="share-meta">
+          <div class="share-label">${escapeHtml(e.label)}</div>
+          <a class="share-url" href="${escapeHtml(e.url)}" target="_blank" rel="noopener">${escapeHtml(e.url)}</a>
+          <div class="share-actions">
+            <button type="button" class="btn btn-ghost" data-act="copy" data-url="${escapeHtml(e.url)}">Copy link</button>
+            <button type="button" class="btn btn-ghost" data-act="open" data-url="${escapeHtml(e.url)}">Open</button>
+          </div>
+        </div>
+      </div>`).join("");
+    host.onclick = async (ev) => {
+      const btn = ev.target.closest("button"); if (!btn) return;
+      const url = btn.dataset.url;
+      if (btn.dataset.act === "copy") {
+        try { await navigator.clipboard.writeText(url); toast("Link copied"); }
+        catch { toast("Copy failed"); }
+      } else if (btn.dataset.act === "open") {
+        window.open(url, "_blank", "noopener");
+      }
+    };
+  } catch (err) {
+    host.innerHTML = `<p class="muted">Failed to load: ${escapeHtml(String(err && err.message || err))}</p>`;
+  }
+}
+function closeShareModal() { $("shareModal").classList.add("hidden"); }
+Object.assign(window, { openShareModal, closeShareModal });
+
 function createChannel(e) {
   e.preventDefault();
   const name = $("newChName").value.trim();

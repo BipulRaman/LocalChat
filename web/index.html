@@ -5,11 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="LocalChat" />
+  <meta name="application-name" content="LocalChat" />
+  <meta name="description" content="LocalChat — a self-contained LAN instant messenger with channels, direct messages, and file sharing. No accounts, no internet, no telemetry." />
+  <meta name="author" content="LocalChat" />
+  <meta name="keywords" content="LocalChat, LAN chat, local chat, intranet messenger, offline chat, self-hosted chat, file sharing, WebSocket chat" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="referrer" content="no-referrer" />
+  <meta name="color-scheme" content="light" />
+  <meta name="format-detection" content="telephone=no" />
   <meta name="theme-color" content="#0b141a" media="(prefers-color-scheme: dark)" />
   <meta name="theme-color" content="#f0f2f5" media="(prefers-color-scheme: light)" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="LocalChat" />
+  <meta property="og:title" content="LocalChat" />
+  <meta property="og:description" content="Self-contained LAN instant messenger with channels, DMs, and file sharing." />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="LocalChat" />
+  <meta name="twitter:description" content="Self-contained LAN instant messenger with channels, DMs, and file sharing." />
   <title>LocalChat</title>
-  <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236366f1'/%3E%3Cpath d='M10 10h3v10h7v3H10z' fill='white'/%3E%3C/svg%3E"/>
-  <link rel="stylesheet" href="/style.css?v=20260418b"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='32' y2='32' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%238b5cf6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M8 10a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-5l-4 3v-3h-1a3 3 0 0 1-3-3z' fill='white'/%3E%3Ccircle cx='13' cy='13.5' r='1.3' fill='%236366f1'/%3E%3Ccircle cx='16' cy='13.5' r='1.3' fill='%236366f1'/%3E%3Ccircle cx='19' cy='13.5' r='1.3' fill='%236366f1'/%3E%3Ccircle cx='24' cy='8' r='3' fill='%2322c55e' stroke='white' stroke-width='1.5'/%3E%3C/svg%3E"/>
+  <link rel="stylesheet" href="/style.css?v=20260418c"/>
   <script>
     // Migrate old LanChat keys -> LocalChat (one-shot).
     (function () {
@@ -38,12 +54,18 @@
     <div class="join-panel">
       <div class="join-brand">
         <div class="brand-mark">
-          <svg viewBox="0 0 32 32" width="40" height="40" aria-hidden="true">
-            <rect width="32" height="32" rx="8" fill="url(#g)"/>
-            <path d="M10 10h3v10h7v3H10z" fill="white"/>
-            <defs><linearGradient id="g" x1="0" y1="0" x2="32" y2="32">
-              <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
-            </linearGradient></defs>
+          <svg viewBox="0 0 32 32" width="48" height="48" aria-hidden="true">
+            <defs>
+              <linearGradient id="lcGrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
+              </linearGradient>
+            </defs>
+            <rect width="32" height="32" rx="8" fill="url(#lcGrad)"/>
+            <path d="M8 10a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-5l-4 3v-3h-1a3 3 0 0 1-3-3z" fill="white"/>
+            <circle cx="13" cy="13.5" r="1.3" fill="#6366f1"/>
+            <circle cx="16" cy="13.5" r="1.3" fill="#6366f1"/>
+            <circle cx="19" cy="13.5" r="1.3" fill="#6366f1"/>
+            <circle cx="24" cy="8" r="3" fill="#22c55e" stroke="white" stroke-width="1.5"/>
           </svg>
         </div>
         <h1>LocalChat</h1>
@@ -80,12 +102,17 @@
       <div class="sb-header">
         <div class="sb-brand">
           <div class="brand-mark sm">
-            <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
-              <rect width="32" height="32" rx="8" fill="url(#g2)"/>
-              <path d="M10 10h3v10h7v3H10z" fill="white"/>
-              <defs><linearGradient id="g2" x1="0" y1="0" x2="32" y2="32">
-                <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
-              </linearGradient></defs>
+            <svg viewBox="0 0 32 32" width="24" height="24" aria-hidden="true">
+              <defs>
+                <linearGradient id="lcGrad2" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                  <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
+                </linearGradient>
+              </defs>
+              <rect width="32" height="32" rx="8" fill="url(#lcGrad2)"/>
+              <path d="M8 10a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-5l-4 3v-3h-1a3 3 0 0 1-3-3z" fill="white"/>
+              <circle cx="13" cy="13.5" r="1.3" fill="#6366f1"/>
+              <circle cx="16" cy="13.5" r="1.3" fill="#6366f1"/>
+              <circle cx="19" cy="13.5" r="1.3" fill="#6366f1"/>
             </svg>
           </div>
           <div class="sb-title">
@@ -103,6 +130,11 @@
           <button type="button" class="sb-tab active" data-tab="mine"   onclick="setSidebarTab('mine')">My Chats</button>
           <button type="button" class="sb-tab"        data-tab="online" onclick="setSidebarTab('online')">Online</button>
           <button type="button" class="sb-tab"        data-tab="all"    onclick="setSidebarTab('all')">All</button>
+          <button type="button" class="icon-btn sb-tabs-share" id="shareBtn" title="Share / pair with QR" aria-label="Share" onclick="openShareModal()">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM18 14h3v3h-3zM14 18h3v3h-3zM18 18h3v3h-3z" fill="currentColor"/>
+            </svg>
+          </button>
         </div>
 
         <div class="sb-search">
@@ -148,7 +180,7 @@
       <div id="typing" class="typing-row"></div>
 
       <form id="sendForm" class="composer" autocomplete="off">
-        <textarea id="msgInput" rows="1" placeholder="Message #general…" maxlength="4000"></textarea>
+        <textarea id="msgInput" rows="1" placeholder="Type a message" maxlength="4000"></textarea>
         <button type="button" class="emoji-btn" id="emojiBtn" title="Emoji" aria-label="Emoji">
           <span aria-hidden="true">😊</span>
         </button>
@@ -200,6 +232,22 @@
       <div class="modal-body">
         <p class="muted sm">Messages are encrypted end-to-end. Not even the server admin can read them.</p>
         <ul id="dmPickList" class="pick-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ SHARE / QR MODAL ═══════════════════ -->
+  <div id="shareModal" class="modal hidden" role="dialog" aria-labelledby="shTitle">
+    <div class="modal-panel share-modal-panel">
+      <header class="modal-head">
+        <h3 id="shTitle">Share LocalChat</h3>
+        <button type="button" class="icon-btn" onclick="closeShareModal()" aria-label="Close">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="muted sm" style="margin:0 0 12px;">Scan with another device to open the chat. Anyone on the same Wi-Fi can join.</p>
+        <div id="shareGridUser" class="share-grid"></div>
       </div>
     </div>
   </div>
@@ -275,6 +323,6 @@
     <audio id="remoteAudio" autoplay></audio>
   </div>
 
-  <script src="/app.js?v=20260418b"></script>
+  <script src="/app.js?v=20260418c"></script>
 </body>
 </html>

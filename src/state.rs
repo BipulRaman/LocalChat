@@ -1,7 +1,7 @@
 //! Central shared state. Wrapped in `Arc<AppState>` and handed everywhere.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
@@ -36,6 +36,9 @@ pub struct AppState {
 
     pub next_user_id: AtomicU32,
     pub next_msg_id: AtomicU64,
+
+    /// Actual port the server is listening on (set once after bind).
+    pub bound_port: AtomicU16,
 }
 
 impl AppState {
@@ -83,6 +86,7 @@ impl AppState {
             reaction_log,
             next_user_id: AtomicU32::new(1),
             next_msg_id: AtomicU64::new(1),
+            bound_port: AtomicU16::new(0),
         });
 
         // Replay reaction events into the in-memory map.

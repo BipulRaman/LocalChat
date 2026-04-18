@@ -75,15 +75,16 @@ function toast(msg, ms = 2500) {
 
 async function refreshAll() {
   try {
-    const [stats, users, channels, uploads, settings] = await Promise.all([
+    const [stats, users, channels, uploads, settings, share] = await Promise.all([
       api("/stats"), api("/users"), api("/channels"),
-      api("/uploads"), api("/settings"),
+      api("/uploads"), api("/settings"), api("/share"),
     ]);
     renderStats(stats);
     renderUsers(users.users);
     renderChannels(channels.channels);
     renderUploads(uploads.files);
     loadSettings(settings);
+    renderShare(share.entries || []);
   } catch (err) { console.error(err); toast("Error: " + err.message); }
 }
 
@@ -171,6 +172,34 @@ function renderUploads(files) {
   };
 }
 
+function renderShare(entries) {
+  const host = $("shareGrid");
+  if (!host) return;
+  if (!entries.length) { host.innerHTML = `<p class="muted">No reachable addresses detected.</p>`; return; }
+  host.innerHTML = entries.map((e) => `
+    <div class="share-card">
+      <div class="share-qr">${e.qr}</div>
+      <div class="share-meta">
+        <div class="share-label">${esc(e.label)}</div>
+        <a class="share-url" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)}</a>
+        <div class="share-actions">
+          <button class="btn btn-ghost" data-act="copy" data-url="${esc(e.url)}">Copy link</button>
+          <button class="btn btn-ghost" data-act="open" data-url="${esc(e.url)}">Open</button>
+        </div>
+      </div>
+    </div>`).join("");
+  host.onclick = async (ev) => {
+    const btn = ev.target.closest("button"); if (!btn) return;
+    const url = btn.dataset.url;
+    if (btn.dataset.act === "copy") {
+      try { await navigator.clipboard.writeText(url); toast("Link copied"); }
+      catch { toast("Copy failed"); }
+    } else if (btn.dataset.act === "open") {
+      window.open(url, "_blank", "noopener");
+    }
+  };
+}
+
 function loadSettings(s) {
   $("s_port").value = s.port;
   $("s_max_upload").value = s.maxUploadMb;
@@ -212,7 +241,43 @@ async function broadcast(e) {
   } catch (err) { toast("Error: " + err.message); }
 }
 
-Object.assign(window, { saveToken, logoutAdmin, refreshAll, saveSettings, broadcast, toggleTheme });
+Object.assign(window, { saveToken, logoutAdmin, refreshAll, saveSettings, broadcast, toggleTheme, restartServer, shutdownServer });
+
+async function restartServer() {
+  if (!confirm("Restart the server now? Active connections will drop and reconnect automatically.")) return;
+  try {
+    await api("/restart", { method: "POST" });
+    toast("Restarting…");
+    waitForServerBack();
+  } catch (err) {
+    // The server may close the socket before responding — that's expected.
+    toast("Restart triggered. Reconnecting…");
+    waitForServerBack();
+  }
+}
+
+async function shutdownServer() {
+  if (!confirm("Shut down the server? You'll need to start it again manually.")) return;
+  try {
+    await api("/shutdown", { method: "POST" });
+  } catch {}
+  toast("Server shutting down.");
+}
+
+function waitForServerBack() {
+  let tries = 0;
+  const max = 30;
+  const tick = async () => {
+    tries++;
+    try {
+      const r = await fetch("/api/info", { cache: "no-store" });
+      if (r.ok) { toast("Server back online — reloading…"); setTimeout(() => location.reload(), 600); return; }
+    } catch {}
+    if (tries < max) setTimeout(tick, 700);
+    else toast("Could not reconnect. Reload the page manually.");
+  };
+  setTimeout(tick, 1500);
+}
 
 function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme") || "dark";

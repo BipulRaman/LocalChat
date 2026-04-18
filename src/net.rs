@@ -2,31 +2,27 @@
 
 use std::net::{IpAddr, TcpListener};
 
-/// Memorable, easy-to-type ports tried in order (all >1024, no admin rights).
+/// Memorable, easy-to-type ports tried in order. 443 is first so
+/// URLs can drop the port suffix when running elevated / as a service.
+/// Falls through to high ports that never need admin rights.
 pub const PREFERRED_PORTS: &[u16] =
-    &[5000, 5050, 5555, 8080, 8000, 8888, 3000, 4000, 7000, 9000];
+    &[443, 5000, 5050, 5555, 8443, 8080, 8000, 8888, 3000, 4000, 7000, 9000];
 
 /// Try a specific port; return Some(listener) if free.
 fn try_bind(port: u16) -> Option<TcpListener> {
     TcpListener::bind(("0.0.0.0", port)).ok()
 }
 
-/// Pick a port. If `requested` is Some, honor it exactly (error if taken).
-/// Otherwise try the preferred list, then fall back to an OS-assigned port.
+/// Pick a port. If `requested` is Some, try it first; on failure fall
+/// back to the preferred list, then an OS-assigned ephemeral port.
+/// Never errors unless every single attempt fails (vanishingly unlikely).
 pub fn pick_port(requested: Option<u16>) -> std::io::Result<u16> {
     if let Some(p) = requested {
-        return try_bind(p)
-            .map(|l| {
-                let port = l.local_addr().unwrap().port();
-                drop(l);
-                port
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!("requested port {p} is already in use"),
-                )
-            });
+        if let Some(l) = try_bind(p) {
+            drop(l);
+            return Ok(p);
+        }
+        eprintln!("[warn] requested port {p} is unavailable, falling back…");
     }
 
     for &p in PREFERRED_PORTS {

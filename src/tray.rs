@@ -83,20 +83,22 @@ pub fn run_event_loop(state: Arc<AppState>, port: u16) {
     });
 }
 
-/// Build a 32×32 RGBA indigo-gradient icon with a white "L".
+/// Build a 32×32 RGBA indigo→violet gradient icon with a white speech
+/// bubble and three indigo dots (matches the web/tray branding).
 fn build_icon() -> Icon {
-    const N: usize = 32;
-    let mut buf = Vec::with_capacity(N * N * 4);
+    const N: i32 = 32;
+    let mut buf = Vec::with_capacity((N * N * 4) as usize);
     for y in 0..N {
         for x in 0..N {
-            let (r, g, b) = if is_letter_l(x, y) {
+            let (r, g, b) = if in_dot(x, y) {
+                (99u8, 102u8, 241u8) // indigo dots on the white bubble
+            } else if in_bubble(x, y) {
                 (255u8, 255u8, 255u8)
             } else {
-                let t = (x + y) as u32 * 255 / 62;
-                let r = 80u8.saturating_add((t / 4) as u8);
-                let g = 70u8.saturating_add((t / 6) as u8);
-                let b = 200u8.saturating_add((t / 10).min(55) as u8);
-                (r, g, b)
+                // Background: indigo (#6366f1) → violet (#8b5cf6) diagonal gradient.
+                let t = ((x + y) as f32 / 62.0).clamp(0.0, 1.0);
+                let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+                (lerp(99.0, 139.0), lerp(102.0, 92.0), lerp(241.0, 246.0))
             };
             buf.extend_from_slice(&[r, g, b, 255]);
         }
@@ -104,10 +106,44 @@ fn build_icon() -> Icon {
     Icon::from_rgba(buf, N as u32, N as u32).expect("valid icon dimensions")
 }
 
-fn is_letter_l(x: usize, y: usize) -> bool {
-    let vert = (9..=12).contains(&x) && (7..=24).contains(&y);
-    let bot = (21..=24).contains(&y) && (9..=22).contains(&x);
-    vert || bot
+/// Rounded-rect speech bubble (7..=24 × 7..=20, corner radius 3) with a
+/// triangular tail pointing down to (15, 23).
+fn in_bubble(x: i32, y: i32) -> bool {
+    // Triangular tail below the bubble body.
+    if (21..=23).contains(&y) {
+        let t = 23 - y; // 2,1,0 for y=21,22,23
+        return (15 - t..=15 + t).contains(&x);
+    }
+    // Bubble body (rounded rect).
+    if !(7..=24).contains(&x) || !(7..=20).contains(&y) {
+        return false;
+    }
+    let corner = |cx: i32, cy: i32| {
+        let (dx, dy) = (x - cx, y - cy);
+        dx * dx + dy * dy <= 9
+    };
+    if x < 10 && y < 10 {
+        return corner(10, 10);
+    }
+    if x > 21 && y < 10 {
+        return corner(21, 10);
+    }
+    if x < 10 && y > 17 {
+        return corner(10, 17);
+    }
+    if x > 21 && y > 17 {
+        return corner(21, 17);
+    }
+    true
+}
+
+/// Three 1.5px-radius dots inside the bubble at y=13.
+fn in_dot(x: i32, y: i32) -> bool {
+    const DOTS: [(i32, i32); 3] = [(13, 13), (16, 13), (19, 13)];
+    DOTS.iter().any(|&(dx, dy)| {
+        let (a, b) = (x - dx, y - dy);
+        a * a + b * b <= 2
+    })
 }
 
 fn url_safe(s: &str) -> String {

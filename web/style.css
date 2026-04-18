@@ -304,7 +304,16 @@ input:focus, textarea:focus {
   display: flex; gap: 6px;
   padding: 4px 12px 10px;
   flex-wrap: wrap;
+  align-items: center;
 }
+.sb-tabs-share {
+  margin-left: auto;
+  width: 28px; height: 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-pill);
+  color: var(--fg-2);
+}
+.sb-tabs-share:hover { background: var(--bg-hover); color: var(--fg-0); }
 .sb-tab {
   padding: 5px 12px;
   font-size: 12.5px;
@@ -425,9 +434,50 @@ input:focus, textarea:focus {
   padding: 12px;
   border-top: 1px solid var(--border);
   height: var(--bottom-bar-h);
-  display: flex; align-items: center;
+  display: flex; align-items: center; gap: 8px;
   box-sizing: border-box;
 }
+.sb-foot .me-chip { flex: 1; }
+.sb-foot-btn {
+  flex: 0 0 auto;
+  width: 36px; height: 36px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-2);
+}
+.sb-foot-btn:hover { background: var(--bg-2); color: var(--fg-1); }
+
+/* Share modal — wider panel for QR cards */
+.share-modal-panel { max-width: 520px; width: 92vw; }
+.share-modal-panel .share-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+.share-modal-panel .share-card {
+  display: flex; gap: 14px; align-items: center;
+  padding: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.share-modal-panel .share-qr {
+  width: 140px; height: 140px; flex: 0 0 140px;
+  background: #fff; border-radius: 8px; padding: 6px;
+  display: flex; align-items: center; justify-content: center;
+}
+.share-modal-panel .share-qr svg { width: 100%; height: 100%; display: block; }
+.share-modal-panel .share-meta { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+.share-modal-panel .share-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--fg-3); font-weight: 600;
+}
+.share-modal-panel .share-url {
+  font-family: var(--font-mono); font-size: 12.5px;
+  color: var(--accent); word-break: break-all; text-decoration: none;
+}
+.share-modal-panel .share-url:hover { text-decoration: underline; }
+.share-modal-panel .share-actions { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
 .me-chip {
   display: flex; align-items: center; gap: 10px;
   padding: 6px 8px 6px 10px;
@@ -1175,6 +1225,36 @@ input:focus, textarea:focus {
 }
 .dash-head h1 { margin: 0; font-size: 20px; font-weight: 650; }
 .dash-head .actions { display: flex; gap: 8px; }
+
+/* Share & pair panel */
+.share-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+  margin-top: 8px;
+}
+.share-card {
+  display: flex; gap: 14px; align-items: center;
+  padding: 12px;
+  background: var(--bg-elev, #f8fafc);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.share-qr {
+  width: 140px; height: 140px; flex: 0 0 140px;
+  background: #fff; border-radius: 8px; padding: 6px;
+  display: flex; align-items: center; justify-content: center;
+}
+.share-qr svg { width: 100%; height: 100%; display: block; }
+.share-meta { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+.share-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); font-weight: 600; }
+.share-url {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; color: var(--accent, #4f46e5);
+  word-break: break-all; text-decoration: none;
+}
+.share-url:hover { text-decoration: underline; }
+.share-actions { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
 
 .cards {
   display: grid;

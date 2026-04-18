@@ -1,6 +1,6 @@
 [package]
 name        = "localchat"
-version     = "2.0.0"
+version     = "1.0.0"
 edition     = "2021"
 rust-version = "1.75"
 description = "LAN Instant Messenger — self-contained, tray-only, ultra-light"
@@ -66,6 +66,9 @@ rand        = { version = "0.8", default-features = false, features = ["std", "s
 # Embedded static assets (the entire web/ folder)
 rust-embed  = { version = "8", features = ["compression"] }
 mime_guess  = "2"
+
+# QR code generation for the admin "Share" panel (SVG output, no extra deps).
+qrcode      = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Platform / LAN helpers
 local-ip-address = "0.6"

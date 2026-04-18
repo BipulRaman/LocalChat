@@ -27,6 +27,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/channel/:id", axum::routing::delete(delete_channel))
         .route("/uploads", get(list_uploads))
         .route("/upload/:filename", axum::routing::delete(delete_upload))
+        .route("/share", get(share))
+        .route("/restart", post(restart))
+        .route("/shutdown", post(shutdown))
 }
 
 // ── Authorization ────────────────────────────────────────────────────
@@ -346,6 +349,63 @@ async fn upload_dir_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Returns the LAN URLs the server is reachable at, plus a pre-rendered
+/// SVG QR code for each. Lets the admin page show a "scan to join from
+/// your phone" panel without bundling a JS QR library.
+async fn share(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+
+    // Port the admin themselves connected to (Host header). Falls back
+    // to the actually-bound port, then the configured port, then 443.
+    let port = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            let p = state.bound_port.load(std::sync::atomic::Ordering::Relaxed);
+            if p > 0 { p } else {
+                let cfg = state.config.read().unwrap();
+                if cfg.port > 0 { cfg.port } else { 443 }
+            }
+        });
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push = |label: &str, url: String, entries: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<String>| {
+        if !seen.insert(url.clone()) { return; }
+        let qr = render_qr_svg(&url);
+        entries.push(json!({ "label": label, "url": url, "qr": qr }));
+    };
+
+    push("This computer", format!("https://localhost:{port}"), &mut entries, &mut seen);
+    for ip in crate::net::lan_addresses() {
+        if !ip.starts_with("192.168.") { continue; }
+        push("LAN", format!("https://{ip}:{port}"), &mut entries, &mut seen);
+    }
+
+    Ok(Json(json!({ "entries": entries })))
+}
+
+fn render_qr_svg(data: &str) -> String {
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+    match QrCode::with_error_correction_level(data.as_bytes(), EcLevel::M) {
+        Ok(code) => code
+            .render::<svg::Color<'_>>()
+            .min_dimensions(220, 220)
+            .quiet_zone(true)
+            .dark_color(svg::Color("#0f172a"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+        Err(_) => String::new(),
+    }
+}
+
 #[cfg(windows)]
 fn apply_autostart(enable: bool) -> std::io::Result<()> {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -361,4 +421,51 @@ fn apply_autostart(enable: bool) -> std::io::Result<()> {
         let _ = run.delete_value("LocalChat");
     }
     Ok(())
+}
+
+/// Re-launch the current executable, then exit this process. Lets the
+/// admin apply settings (especially port changes) without manual restart.
+async fn restart(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    spawn_self_and_exit(false);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Stop the server. No respawn.
+async fn shutdown(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    spawn_self_and_exit(true);
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn spawn_self_and_exit(shutdown_only: bool) {
+    // Defer so the HTTP response has time to flush back to the browser.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if !shutdown_only {
+            if let Ok(exe) = std::env::current_exe() {
+                let cwd = std::env::current_dir().ok();
+                let mut cmd = std::process::Command::new(exe);
+                if let Some(d) = cwd { cmd.current_dir(d); }
+                // Detach so the child outlives us.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const DETACHED_PROCESS: u32 = 0x00000008;
+                    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+                    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                }
+                let _ = cmd.spawn();
+            }
+        }
+        std::process::exit(0);
+    });
 }

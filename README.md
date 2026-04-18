@@ -14,7 +14,7 @@ LAN URL with anyone on the same Wi-Fi.
 
 ## For end users (hosting the chat)
 
-1. Download the binary for your OS from [Releases](../../releases).
+1. Download the Windows binary (x64, x86, or arm64) from [Releases](../../releases).
 2. Double-click it.
 3. A tray icon appears. Right-click → "Open chat in browser" (or wait —
    it auto-opens the host's browser). The LAN URL is shown in the tray
@@ -24,7 +24,7 @@ LAN URL with anyone on the same Wi-Fi.
 5. Quit from the tray when you're done.
 
 Allow it through Windows Firewall the first time (Private network only is
-fine). macOS will ask the first time; click "Allow."
+fine).
 
 ### Admin dashboard
 
@@ -80,23 +80,24 @@ LocalChat/
 └─ .github/workflows/build.yml
 ```
 
-### Building cross-platform binaries locally
+### Building Windows binaries locally
 
 ```bash
-# Windows (from Windows host)
+# Native x64 (from Windows host)
 cargo build --release --features tray
 
-# Linux headless (no tray)
-cargo build --release --no-default-features
+# 32-bit x86
+rustup target add i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc --features tray
 
-# macOS Intel / Apple Silicon (from a Mac)
-cargo build --release --target x86_64-apple-darwin  --features tray
-cargo build --release --target aarch64-apple-darwin --features tray
+# arm64
+rustup target add aarch64-pc-windows-msvc
+cargo build --release --target aarch64-pc-windows-msvc --features tray
 ```
 
-CI (see [`.github/workflows/build.yml`](.github/workflows/build.yml))
-builds all 5 targets in parallel on push/PR, and publishes a Release
-when you push a `v*` tag:
+CI (see [.github/workflows/build.yml](.github/workflows/build.yml))
+builds all three Windows architectures (x64, x86, arm64) in parallel on
+push/PR, and publishes a Release when you push a `v*` tag:
 
 ```bash
 git tag v2.0.0 && git push origin v2.0.0
@@ -152,115 +153,6 @@ token on next start.
 Presence and typing events are emitted as synthetic messages on the
 channel with username sentinels `__presence` and `__typing` so every
 subscriber receives them via the same broadcast channel.
-
-## License
-
-MIT
-# LocalChat
-
-A production-grade LAN instant messaging system with file transfer.
-
-Ships as a **single self-contained `LocalChat.exe`** so a non-technical
-user can host a chat server by double-clicking it. Everyone else on the
-same Wi-Fi / LAN just opens the printed link in their browser — no
-install required.
-
-## Features
-
-- **Single-file `.exe`** — no Node.js, no npm, no install on the host
-- **Auto port pick** — prefers memorable ports (5000, 5050, 5555, 8080, …), falls back to any free port
-- **Auto-opens** the host's browser to `http://localhost:<port>`
-- **Real-time messaging** via WebSockets (Socket.IO)
-- **File sharing** with drag & drop, progress, image/video previews
-- **User presence**, **typing indicators**, **message history** (last 200)
-- **LAN-only** — private by default, no internet required
-
-## For end users (host the chat)
-
-1. Download `LocalChat.exe`.
-2. Double-click it. A console window opens and prints something like:
-   ```
-   💻  This computer:   http://localhost:5000
-   📡  LAN access:     http://192.168.1.42:5000
-   ```
-3. Your browser opens automatically. Pick a username and start chatting.
-4. Share the **LAN access** link with anyone on the same network.
-5. To stop the server, close the console window.
-
-Allow it through Windows Firewall the first time (Private network is enough).
-
-## For developers
-
-```bash
-# Install all dependencies (server + client)
-npm install
-
-# Run both server and client in development mode
-npm run dev
-```
-
-Dev client: **http://localhost:3000**, dev server: **http://localhost:5000**.
-
-### Build the standalone executable
-
-```bash
-# Windows .exe (run on any OS thanks to pkg cross-compile)
-npm run package:win
-# → dist/LocalChat.exe
-
-# macOS / Linux equivalents
-npm run package:mac
-npm run package:linux
-```
-
-The resulting binary embeds Node.js, the server code, **and** the built
-React client. It writes uploaded files to an `uploads/` folder created
-next to the executable.
-
-## Production (without packaging)
-
-```bash
-npm run build      # build the React client
-npm start          # start the server (serves the built client too)
-```
-
-## Tech Stack
-
-| Layer    | Technology              |
-|----------|------------------------|
-| Backend  | Node.js, Express, Socket.IO |
-| Frontend | React 18, Vite         |
-| Styling  | Custom CSS (no frameworks) |
-| Files    | Multer (upload), streaming (download) |
-
-## Project Structure
-
-```
-LocalChat/
-├── server/
-│   └── index.js          # Express + Socket.IO server
-├── client/
-│   ├── src/
-│   │   ├── App.jsx       # Main app component
-│   │   ├── index.css     # Global styles
-│   │   └── components/
-│   │       ├── JoinScreen.jsx
-│   │       ├── ChatWindow.jsx
-│   │       ├── MessageBubble.jsx
-│   │       ├── FileUpload.jsx
-│   │       └── Sidebar.jsx
-│   ├── index.html
-│   └── vite.config.js
-├── uploads/              # Uploaded files (auto-created)
-└── package.json
-```
-
-## Configuration
-
-| Variable / flag      | Default                              | Description                                                       |
-|----------------------|--------------------------------------|-------------------------------------------------------------------|
-| `PORT` env / `--port=N` | auto-pick from 5000, 5050, 5555, 8080, 8000, 8888, 3000, 4000, 7000, 9000 → then any free port | Force a specific port. Fails if it's taken. |
-| `NO_BROWSER=1` / `--no-browser` | off (auto-opens when running the .exe) | Don't auto-open the host's browser.                       |
 
 ## License
 
