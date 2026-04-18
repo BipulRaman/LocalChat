@@ -1,5 +1,5 @@
 // ═════════════════════════════════════════════════════════════════════
-// LanChat — chat client
+// LocalChat — chat client
 // • Vanilla JS, no build step
 // • E2EE for DMs (ECDH P-256 + AES-GCM, Web Crypto API)
 // ═════════════════════════════════════════════════════════════════════
@@ -89,7 +89,7 @@ const E2EE = {
   sharedCache: new Map(),   // userId → AES-GCM CryptoKey (derived)
 
   async init() {
-    const stored = localStorage.getItem("lanchat-e2ee-kp");
+    const stored = localStorage.getItem("localchat-e2ee-kp");
     if (stored) {
       try {
         const { privJwk, pubJwk } = JSON.parse(stored);
@@ -104,7 +104,7 @@ const E2EE = {
     const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
     const privJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
     const pubJwk  = await crypto.subtle.exportKey("jwk", kp.publicKey);
-    localStorage.setItem("lanchat-e2ee-kp", JSON.stringify({ privJwk, pubJwk }));
+    localStorage.setItem("localchat-e2ee-kp", JSON.stringify({ privJwk, pubJwk }));
     this.kp = { privateKey: kp.privateKey, publicKey: kp.publicKey, publicJwk: pubJwk };
   },
 
@@ -198,7 +198,7 @@ const S = {
   }).catch(() => {});
 
   // Auto-rejoin if we previously chose a username on this device.
-  const saved = localStorage.getItem("lanchat-username");
+  const saved = localStorage.getItem("localchat-username");
   if (saved) {
     $("username").value = saved;
     connect(saved);
@@ -210,7 +210,7 @@ $("joinForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const username = $("username").value.trim();
   if (!username) return;
-  localStorage.setItem("lanchat-username", username);
+  localStorage.setItem("localchat-username", username);
   connect(username);
 });
 
@@ -270,7 +270,7 @@ function onError(e) {
   if (!S.me) {
     // Server rejected our auto-join (e.g. banned, bad name). Drop the
     // saved name so the join screen lets the user pick a new one.
-    localStorage.removeItem("lanchat-username");
+    localStorage.removeItem("localchat-username");
     $("joinStatus").textContent = e.text || "error";
     return;
   }
@@ -549,7 +549,7 @@ async function renderMessage(m, { follow, peer, ch }) {
     );
   }
 
-  const isOwn = m.userId === S.me?.id;
+  const isOwn = m.userId === S.me?.id || (S.me && m.username === S.me.username);
   const isDm  = ch && ch.kind === "dm";
 
   // Decrypt DM ciphertext when possible.
@@ -575,11 +575,27 @@ async function renderMessage(m, { follow, peer, ch }) {
 
   const bubble = el("div", { class: "bubble" });
 
-  if (!follow && !isOwn && !isDm) {
-    bubble.append(el("span", {
-      class: "author",
-      style: `color:${m.color || "var(--brand)"}`,
-    }, m.username));
+  // Header row above the bubble (Teams-style):
+  //  - incoming first-of-group: "Author • Time"
+  //  - own first-of-group: "Time" right-aligned
+  //  - DM first-of-group: "Time"
+  //  - follow-up bubbles: no header
+  let header = null;
+  const showAuthor = !follow && !isOwn && !isDm;
+  if (!follow) {
+    if (showAuthor) {
+      header = el("div", { class: "msg-header" }, [
+        el("span", {
+          class: "author",
+          style: `color:${m.color || "var(--brand)"}`,
+        }, m.username),
+        el("span", { class: "header-time" }, fmtTime(m.ts)),
+      ]);
+    } else {
+      header = el("div", { class: "msg-header own-header" }, [
+        el("span", { class: "header-time" }, fmtTime(m.ts)),
+      ]);
+    }
   }
 
   if (m.kind === "file" && m.file) {
@@ -621,15 +637,14 @@ async function renderMessage(m, { follow, peer, ch }) {
     bubble.append(el("div", { class: cls }, displayText));
   }
 
-  // Inline meta: time + (lock for E2EE) + (ticks for own messages)
+  // Inline meta inside bubble: only ticks (own) + lock (E2EE). Time is in the header above.
   const metaChildren = [];
   if (encrypted) {
     metaChildren.push(el("span", { class: "enc-tag", title: "End-to-end encrypted" },
       svg("M6 10V7a6 6 0 0112 0v3M5 10h14v10H5z", 10, 2)));
   }
-  metaChildren.push(el("span", { class: "time" }, fmtTime(m.ts)));
   if (isOwn) metaChildren.push(renderTicks("sent"));
-  bubble.append(el("div", { class: "meta" }, metaChildren));
+  if (metaChildren.length) bubble.append(el("div", { class: "meta" }, metaChildren));
 
   // Reaction bar (rendered below the text inside bubble) + hover quick-add.
   const perCh = S.reactions.get(m.channel);
@@ -675,7 +690,11 @@ async function renderMessage(m, { follow, peer, ch }) {
   if (follow) classes.push("follow");
   else        classes.push("has-tail");
 
-  return el("div", { class: classes.join(" ") }, [avatar, bubble]);
+  const stack = el("div", { class: "msg-stack" });
+  if (header) stack.append(header);
+  stack.append(bubble);
+
+  return el("div", { class: classes.join(" ") }, [avatar, stack]);
 }
 
 // WhatsApp-style ticks. Single grey = sent; double grey = delivered; double blue = read.
@@ -932,7 +951,7 @@ function openDmPicker() {
 function toggleSidebar() { $("sidebar").classList.toggle("open"); }
 
 function signOut() {
-  localStorage.removeItem("lanchat-username");
+  localStorage.removeItem("localchat-username");
   // Close socket cleanly so we don't auto-reconnect.
   if (S.ws) {
     try { S.ws.onclose = null; S.ws.close(); } catch {}
@@ -1126,7 +1145,7 @@ function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme") || "dark";
   const next = cur === "dark" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", next);
-  localStorage.setItem("lanchat-theme", next);
+  localStorage.setItem("localchat-theme", next);
   updateThemeIcon();
 }
 function updateThemeIcon() {

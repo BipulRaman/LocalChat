@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   LanChat — design system
+   LocalChat — design system
    ─────────────────────────────────────────────────────────────────── */
 
 :root {
@@ -514,6 +514,39 @@ input:focus, textarea:focus {
 .msg .avatar { margin-bottom: 2px; }
 .msg .avatar-spacer { width: 28px; flex: 0 0 28px; }
 
+/* Stack wraps the optional header row + the bubble vertically */
+.msg-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* Stack is bounded so the bubble's max-width works against a real container. */
+  max-width: 78%;
+}
+/* Own messages: pin the stack to the right edge of the row */
+.msg.own .msg-stack { margin-left: auto; }
+
+/* Header row above bubble: Author • Time (incoming) or Time (own/DM) */
+.msg-header {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 0 4px;
+  margin-bottom: 2px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--fg-3);
+  user-select: none;
+}
+[data-theme="light"] .msg-header { color: #667781; }
+.msg-header .author {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.msg-header .header-time {
+  font-size: 10.5px;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.msg-header.own-header { justify-content: flex-end; }
+
 /* Own messages → right side */
 .msg.own { flex-direction: row-reverse; }
 .msg.own .avatar-spacer { display: none; }
@@ -525,8 +558,9 @@ input:focus, textarea:focus {
 /* ─── Bubble ─────────────────────────────────────────────── */
 .bubble {
   position: relative;
-  max-width: min(65ch, 78%);
-  padding: 6px 9px 8px 12px;
+  max-width: 65ch;
+  width: fit-content;
+  padding: 6px 10px 6px 12px;
   background: var(--wa-other);
   color: var(--fg-0);
   border-radius: 8px;
@@ -543,22 +577,20 @@ input:focus, textarea:focus {
   width: 360px;
   max-width: 78%;
   padding: 4px;
-  overflow: hidden;
+  /* overflow visible so reaction chips & hover actions can sit outside */
 }
-/* Author name above image: keep a small horizontal inset */
-.bubble:has(.image-att) > .author {
-  padding: 4px 8px 4px;
-  margin: 0;
-}
+/* Author row above image (legacy — header sits outside bubble now) */
+.bubble:has(.image-att) > .author-row,
+.bubble:has(.image-att) > .author { display: none; }
 /* Caption sits below image with comfortable padding */
 .bubble:has(.image-att) > .text {
   padding: 6px 8px 4px 8px;
-  padding-right: 70px; /* room for inline meta */
+  padding-right: 8px;
 }
-.msg.own .bubble:has(.image-att) > .text { padding-right: 80px; }
-.bubble:has(.image-att) > .meta { right: 12px; bottom: 8px; }
+.msg.own .bubble:has(.image-att) > .text { padding-right: 32px; }
+.bubble:has(.image-att) > .meta { right: 10px; bottom: 8px; }
 
-/* No caption: meta overlays the image with a soft gradient backdrop */
+/* No caption: ticks (own) overlay the image with a soft gradient backdrop */
 .bubble:has(.image-att):not(:has(> .text)) > .meta {
   position: absolute;
   right: 10px;
@@ -598,22 +630,17 @@ input:focus, textarea:focus {
   clip-path: polygon(0 0, 0 100%, 100% 0);
 }
 
-/* Author name (only first incoming bubble of a group, non-DM) */
-.bubble .author {
-  display: block;
-  font-size: 12.8px;
-  font-weight: 600;
-  margin-bottom: 2px;
-  line-height: 1.2;
-}
+/* Legacy author-row inside bubble (no longer rendered, kept harmless). */
+.bubble .author-row { display: none; }
+.bubble .author { display: none; }
 
 /* Text */
 .bubble .text {
   white-space: pre-wrap;
-  /* Reserve room on the right for the inline meta */
-  padding-right: 56px;
+  /* Reserve a small right pad for own-msg ticks (no time inside bubble anymore). */
+  padding-right: 0;
 }
-.msg.own .bubble .text { padding-right: 70px; }
+.msg.own .bubble .text { padding-right: 28px; }
 .bubble .text.jumbo {
   font-size: 38px;
   line-height: 1.15;
@@ -621,23 +648,22 @@ input:focus, textarea:focus {
   margin-bottom: 14px;
 }
 
-/* Inline meta: time + ticks, bottom-right of bubble */
+/* Inline meta: ticks (own) + lock (E2EE), nested at bottom-right of bubble.
+   Time has moved to the header above the bubble. */
 .bubble .meta {
   position: absolute;
-  right: 8px; bottom: 4px;
+  right: 6px; bottom: 3px;
   display: inline-flex; align-items: center; gap: 3px;
-  font-size: 11px;
   line-height: 1;
   color: var(--fg-3);
-  white-space: nowrap;
   user-select: none;
 }
 [data-theme="light"] .bubble .meta { color: #667781; }
 .msg.own .bubble .meta { color: rgba(231,233,239,0.55); }
 [data-theme="light"] .msg.own .bubble .meta { color: #667781; }
-.bubble .meta .enc-tag svg { width: 9px; height: 9px; }
+.bubble .meta .enc-tag svg { width: 8px; height: 8px; }
 .bubble .meta .ticks { display: inline-flex; align-items: center; }
-.bubble .meta .ticks svg { display: block; }
+.bubble .meta .ticks svg { display: block; width: 13px; height: 10px; }
 .bubble .meta .ticks.read { color: var(--wa-tick); }
 
 /* System message — centered pill */
@@ -662,6 +688,12 @@ input:focus, textarea:focus {
 /* ─── File attachment (inside bubble) ───────────────────────── */
 .bubble .attachment {
   display: flex; flex-direction: column;
+}
+/* Bubbles that contain a (non-image) file attachment: keep ticks tucked at right */
+.bubble:has(> .attachment > .file) > .meta {
+  position: absolute;
+  right: 8px;
+  bottom: 4px;
 }
 .bubble .file {
   display: inline-flex; align-items: center; gap: 12px;
@@ -987,42 +1019,52 @@ input:focus, textarea:focus {
 /* ═══════════════════════════════════════════════════════════════════
    REACTIONS
    ─────────────────────────────────────────────────────────────────── */
-/* Floating chip pinned to the bottom-left of the bubble (WA-style). */
+/* Floating chip pinned to the bottom of the bubble (WA-style). */
 .bubble .reactions {
   position: absolute;
-  left: 8px;
   bottom: -12px;
-  display: inline-flex; flex-wrap: wrap; gap: 3px;
+  left: 10px; right: auto;
+  display: inline-flex; flex-wrap: nowrap; gap: 3px;
+  white-space: nowrap;
   z-index: 2;
 }
-.msg.own .bubble .reactions {
-  left: auto;
-  right: 8px;
-}
-/* Make sure following bubbles don't visually collide with chip. */
+.msg.own .bubble .reactions { left: auto; right: 10px; }
+
+/* When reactions are present, give the bubble extra bottom room for the floating chip. */
+.bubble:has(> .reactions) { padding-bottom: 18px; }
+/* Own bubbles: ticks live bottom-right; chip is on right too — keep both visible. */
+.msg.own .bubble:has(> .reactions) > .meta { right: 8px; bottom: 4px; }
+
+/* Reserve outside margin so the chip doesn't crash into the next msg. */
 .msg:has(.reactions) { margin-bottom: 14px; }
 
 .bubble .reaction {
   display: inline-flex; align-items: center; gap: 3px;
   padding: 2px 8px 2px 6px;
   font-size: 12px; line-height: 1.2;
-  background: var(--wa-other);
+  background: var(--bg-1);
   color: var(--fg-0);
   border-radius: 999px;
   border: 1.5px solid var(--wa-stream-bg);
-  box-shadow: 0 1px 1.5px rgba(0,0,0,0.15);
+  box-shadow: 0 1px 1.5px rgba(0,0,0,0.18);
   cursor: pointer;
   transition: transform var(--transition);
 }
 [data-theme="light"] .bubble .reaction {
   background: #fff;
   color: #111b21;
-  border-color: var(--wa-stream-bg);
+  border-color: #e9edef;
 }
 .bubble .reaction:hover { transform: scale(1.08); }
 .bubble .reaction.mine {
-  background: var(--wa-own);
-  color: var(--wa-own-fg);
+  background: var(--brand-soft);
+  color: var(--brand);
+  border-color: color-mix(in srgb, var(--brand) 35%, transparent);
+}
+[data-theme="light"] .bubble .reaction.mine {
+  background: color-mix(in srgb, var(--brand) 12%, #fff);
+  color: var(--brand);
+  border-color: color-mix(in srgb, var(--brand) 30%, #fff);
 }
 .bubble .reaction .r-emoji { font-size: 13px; }
 .bubble .reaction .r-count {

@@ -356,9 +356,9 @@ fn apply_autostart(enable: bool) -> std::io::Result<()> {
         let exe = std::env::current_exe()?
             .to_string_lossy()
             .to_string();
-        run.set_value("LanChat", &exe)?;
+        run.set_value("LocalChat", &exe)?;
     } else {
-        let _ = run.delete_value("LanChat");
+        let _ = run.delete_value("LocalChat");
     }
     Ok(())
 }

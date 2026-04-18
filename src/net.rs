@@ -62,7 +62,7 @@ pub fn lan_addresses() -> Vec<String> {
 pub fn print_banner(port: u16, addrs: &[String], state: &std::sync::Arc<crate::state::AppState>) {
     println!();
     println!("  ╔══════════════════════════════════════════════════════════╗");
-    println!("  ║   LanChat — LAN Instant Messenger                        ║");
+    println!("  ║   LocalChat — LAN Instant Messenger                       ║");
     println!("  ╚══════════════════════════════════════════════════════════╝");
     println!();
     println!("  ✅  Server running. Keep this window / tray icon alive.");
@@ -82,7 +82,7 @@ pub fn print_banner(port: u16, addrs: &[String], state: &std::sync::Arc<crate::s
     }
     println!();
     println!("  📁  Data folder:     {}", state.app_root.display());
-    println!("  📝  Log file:        {}", state.logs_dir.join("lanchat.log").display());
+    println!("  📝  Log file:        {}", state.logs_dir.join("localchat.log").display());
     println!("  🔑  Admin token:     {}", state.config.read().unwrap().admin_token);
     println!();
     println!("  Share the LAN link above with people on the same Wi-Fi.");

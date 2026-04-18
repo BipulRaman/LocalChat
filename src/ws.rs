@@ -99,7 +99,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
             join.avatar.chars().take(4).collect::<String>().to_compact_string()
         },
         color: if join.color.is_empty() {
-            pick_color(user_id).to_compact_string()
+            pick_color_for(&username).to_compact_string()
         } else {
             join.color.chars().take(16).collect::<String>().to_compact_string()
         },
@@ -217,12 +217,19 @@ fn sanitize_username(u: &str) -> CompactString {
     cleaned.to_compact_string()
 }
 
-fn pick_color(seed: UserId) -> &'static str {
+/// Stable color from a username (case-insensitive, FNV-1a 32-bit hash).
+fn pick_color_for(username: &str) -> &'static str {
     const COLORS: &[&str] = &[
         "#6366f1", "#8b5cf6", "#ec4899", "#ef4444", "#f97316",
         "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
     ];
-    COLORS[seed as usize % COLORS.len()]
+    let mut h: u32 = 0x811c9dc5;
+    for b in username.as_bytes() {
+        let lower = b.to_ascii_lowercase();
+        h ^= lower as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    COLORS[(h as usize) % COLORS.len()]
 }
 
 /// Merge-style receive: await on whichever channel fires first.

@@ -1,6 +1,6 @@
 //! Tiny append-only file logger.
 //!
-//! Writes a single `lanchat.log` file inside the app-data `logs/` dir
+//! Writes a single `localchat.log` file inside the app-data `logs/` dir
 //! and rotates once it crosses ~5 MB. Plain UTF-8, one line per event.
 //! Also mirrors each line to stderr so the console / debug build still
 //! shows activity.
@@ -25,7 +25,7 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 pub fn init(logs_dir: &Path) {
     let _ = std::fs::create_dir_all(logs_dir);
-    let path = logs_dir.join("lanchat.log");
+    let path = logs_dir.join("localchat.log");
     let _ = LOGGER.set(Logger {
         file: Mutex::new(open(&path)),
         path,

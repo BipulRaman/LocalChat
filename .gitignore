@@ -7,9 +7,9 @@ Cargo.lock.bak
 # Runtime data
 /uploads
 /history
-lanchat-config.json
-lanchat-history*.jsonl
-lanchat.log
+LocalChat-config.json
+LocalChat-history*.jsonl
+LocalChat.log
 
 # OS / editor
 .DS_Store

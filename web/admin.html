@@ -3,12 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LanChat — Admin</title>
+  <title>LocalChat — Admin</title>
   <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ef4444'/%3E%3Cpath d='M10 10h3v10h7v3H10z' fill='white'/%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
   <script>
     (function () {
-      var saved = localStorage.getItem("lanchat-theme");
+      try {
+        var keys = ["theme","username","e2ee-kp","admin-token"];
+        keys.forEach(function (k) {
+          var oldK = "lanchat-" + k, newK = "localchat-" + k;
+          if (localStorage.getItem(newK) == null && localStorage.getItem(oldK) != null) {
+            localStorage.setItem(newK, localStorage.getItem(oldK));
+            localStorage.removeItem(oldK);
+          }
+        });
+      } catch (e) {}
+    })();
+    (function () {
+      var saved = localStorage.getItem("localchat-theme");
       var mql = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
       var theme = saved || (mql && mql.matches ? "light" : "dark");
       document.documentElement.setAttribute("data-theme", theme);
@@ -26,7 +38,7 @@
             <path d="M10 10h3v10h7v3H10z" fill="white"/>
           </svg>
         </div>
-        <h1>LanChat Admin</h1>
+        <h1>LocalChat Admin</h1>
         <p class="muted">Paste the admin token from the server log or tray menu.</p>
       </div>
       <label class="field">
@@ -40,7 +52,7 @@
   <!-- Dashboard -->
   <div id="dash" class="dash hidden">
     <header class="dash-head">
-      <h1>LanChat Admin</h1>
+      <h1>LocalChat Admin</h1>
       <div class="actions">
         <button class="btn btn-ghost" onclick="toggleTheme()" title="Toggle theme" id="themeBtn"></button>
         <button class="btn btn-ghost" onclick="refreshAll()">

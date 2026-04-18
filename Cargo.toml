@@ -1,14 +1,14 @@
 [package]
-name        = "lanchat"
+name        = "localchat"
 version     = "2.0.0"
 edition     = "2021"
 rust-version = "1.75"
 description = "LAN Instant Messenger — self-contained, tray-only, ultra-light"
 license     = "MIT"
-default-run = "lanchat"
+default-run = "localchat"
 
 [[bin]]
-name = "lanchat"
+name = "localchat"
 path = "src/main.rs"
 
 # ─── Ultra-slim release profile ──────────────────────────────────────

@@ -1,4 +1,4 @@
-// LanChat — admin dashboard.
+// LocalChat — admin dashboard.
 
 "use strict";
 
@@ -8,11 +8,11 @@ let token = null;
 function init() {
   const urlTok = new URLSearchParams(location.search).get("token");
   if (urlTok) {
-    localStorage.setItem("lanchat-admin-token", urlTok);
+    localStorage.setItem("localchat-admin-token", urlTok);
     history.replaceState({}, "", location.pathname);
     token = urlTok;
   } else {
-    token = localStorage.getItem("lanchat-admin-token");
+    token = localStorage.getItem("localchat-admin-token");
   }
   if (token) { showDash(); refreshAll(); }
 }
@@ -22,13 +22,13 @@ async function saveToken(e) {
   const t = $("tokenInput").value.trim();
   if (!t) return;
   token = t;
-  localStorage.setItem("lanchat-admin-token", t);
+  localStorage.setItem("localchat-admin-token", t);
   showDash();
   try { await refreshAll(); } catch { /* unauthorized handled */ }
 }
 function logoutAdmin() {
   token = null;
-  localStorage.removeItem("lanchat-admin-token");
+  localStorage.removeItem("localchat-admin-token");
   $("dash").classList.add("hidden");
   $("auth").classList.remove("hidden");
 }
@@ -218,7 +218,7 @@ function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme") || "dark";
   const next = cur === "dark" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", next);
-  localStorage.setItem("lanchat-theme", next);
+  localStorage.setItem("localchat-theme", next);
   updateThemeIcon();
 }
 function updateThemeIcon() {

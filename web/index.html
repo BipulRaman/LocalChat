@@ -3,13 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LanChat</title>
+  <title>LocalChat</title>
   <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236366f1'/%3E%3Cpath d='M10 10h3v10h7v3H10z' fill='white'/%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
   <script>
+    // Migrate old LanChat keys -> LocalChat (one-shot).
+    (function () {
+      try {
+        var keys = ["theme","username","e2ee-kp","admin-token"];
+        keys.forEach(function (k) {
+          var oldK = "lanchat-" + k, newK = "localchat-" + k;
+          if (localStorage.getItem(newK) == null && localStorage.getItem(oldK) != null) {
+            localStorage.setItem(newK, localStorage.getItem(oldK));
+            localStorage.removeItem(oldK);
+          }
+        });
+      } catch (e) {}
+    })();
     // Apply saved theme before paint to avoid flash.
     (function () {
-      var saved = localStorage.getItem("lanchat-theme");
+      var saved = localStorage.getItem("localchat-theme");
       var mql = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
       var theme = saved || (mql && mql.matches ? "light" : "dark");
       document.documentElement.setAttribute("data-theme", theme);
@@ -30,7 +43,7 @@
             </linearGradient></defs>
           </svg>
         </div>
-        <h1>LanChat</h1>
+        <h1>LocalChat</h1>
         <p class="muted">Private messaging for your local network</p>
       </div>
 
@@ -73,7 +86,7 @@
             </svg>
           </div>
           <div class="sb-title">
-            <div class="h6">LanChat</div>
+            <div class="h6">LocalChat</div>
             <div class="muted xs" id="hostInfo">connecting…</div>
           </div>
         </div>

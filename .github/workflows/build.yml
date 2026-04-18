@@ -1,4 +1,4 @@
-name: Build LanChat binaries
+name: Build LocalChat binaries
 
 on:
   push:
@@ -27,23 +27,23 @@ jobs:
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             features: --features tray
-            artifact: lanchat-windows-x64.exe
-            bin: lanchat.exe
+            artifact: LocalChat-windows-x64.exe
+            bin: LocalChat.exe
 
           # Linux runs without the tray feature (avoids GTK requirement).
           - name: Linux x64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: --no-default-features
-            artifact: lanchat-linux-x64
-            bin: lanchat
+            artifact: LocalChat-linux-x64
+            bin: LocalChat
 
           - name: Linux arm64
             runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             features: --no-default-features
-            artifact: lanchat-linux-arm64
-            bin: lanchat
+            artifact: LocalChat-linux-arm64
+            bin: LocalChat
             cross: true
 
           # macOS Intel — "old" Macs (pre-M1). macos-13 is the last Intel runner.
@@ -51,16 +51,16 @@ jobs:
             runner: macos-13
             target: x86_64-apple-darwin
             features: --features tray
-            artifact: lanchat-macos-x64
-            bin: lanchat
+            artifact: LocalChat-macos-x64
+            bin: LocalChat
 
           # macOS Apple Silicon — "new" Macs (M1/M2/M3/M4).
           - name: macOS Apple Silicon (arm64)
             runner: macos-14
             target: aarch64-apple-darwin
             features: --features tray
-            artifact: lanchat-macos-arm64
-            bin: lanchat
+            artifact: LocalChat-macos-arm64
+            bin: LocalChat
 
     steps:
       - name: Checkout

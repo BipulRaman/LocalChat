@@ -1,4 +1,4 @@
-# LanChat
+# LocalChat
 
 A self-contained LAN instant messenger. One native binary. No installer.
 No Node.js. No Python. No config. Double-click to run; share the printed
@@ -55,12 +55,12 @@ port. Override with `PORT=xxxx` env or `--port=xxxx`.
 ### Layout
 
 ```
-LanChat/
+LocalChat/
 ├─ Cargo.toml
 ├─ src/
 │  ├─ main.rs         # entry: tokio runtime + tray event loop
 │  ├─ state.rs        # AppState (users, channels, metrics, config)
-│  ├─ config.rs       # Config (loaded from lanchat-config.json)
+│  ├─ config.rs       # Config (loaded from LocalChat-config.json)
 │  ├─ user.rs         # UserInfo
 │  ├─ message.rs      # WireMsg, MsgKind, FileInfo
 │  ├─ channel.rs      # Channel, DM/group/lobby, broadcast bus
@@ -107,8 +107,8 @@ git tag v2.0.0 && git push origin v2.0.0
 Next to the binary:
 
 ```
-lanchat(.exe)
-lanchat-config.json         # port, admin token, settings, banlist
+LocalChat(.exe)
+LocalChat-config.json         # port, admin token, settings, banlist
 uploads/                    # shared files
 history/                    # append-only JSONL per channel
   pub-general.jsonl
@@ -117,7 +117,7 @@ history/                    # append-only JSONL per channel
 ```
 
 Delete `history/` to wipe messages. Delete `uploads/` to wipe files.
-Delete `lanchat-config.json` to reset settings and regenerate the admin
+Delete `LocalChat-config.json` to reset settings and regenerate the admin
 token on next start.
 
 ## Wire protocol (WebSocket, text frames, JSON)
@@ -156,11 +156,11 @@ subscriber receives them via the same broadcast channel.
 ## License
 
 MIT
-# LanChat
+# LocalChat
 
 A production-grade LAN instant messaging system with file transfer.
 
-Ships as a **single self-contained `lanchat.exe`** so a non-technical
+Ships as a **single self-contained `LocalChat.exe`** so a non-technical
 user can host a chat server by double-clicking it. Everyone else on the
 same Wi-Fi / LAN just opens the printed link in their browser — no
 install required.
@@ -177,7 +177,7 @@ install required.
 
 ## For end users (host the chat)
 
-1. Download `lanchat.exe`.
+1. Download `LocalChat.exe`.
 2. Double-click it. A console window opens and prints something like:
    ```
    💻  This computer:   http://localhost:5000
@@ -206,7 +206,7 @@ Dev client: **http://localhost:3000**, dev server: **http://localhost:5000**.
 ```bash
 # Windows .exe (run on any OS thanks to pkg cross-compile)
 npm run package:win
-# → dist/lanchat.exe
+# → dist/LocalChat.exe
 
 # macOS / Linux equivalents
 npm run package:mac
@@ -236,7 +236,7 @@ npm start          # start the server (serves the built client too)
 ## Project Structure
 
 ```
-LanChat/
+LocalChat/
 ├── server/
 │   └── index.js          # Express + Socket.IO server
 ├── client/

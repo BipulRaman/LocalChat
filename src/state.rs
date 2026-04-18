@@ -17,7 +17,7 @@ pub type ReactionKey = (ChannelId, u64);
 pub type EmojiKey = compact_str::CompactString;
 
 pub struct AppState {
-    pub app_root: PathBuf,   // OS app-data dir (e.g. %APPDATA%\LanChat)
+    pub app_root: PathBuf,   // OS app-data dir (e.g. %APPDATA%\LocalChat)
     pub uploads_dir: PathBuf,
     pub config_path: PathBuf,
     pub history_dir: PathBuf,
@@ -114,26 +114,26 @@ impl AppState {
 /// Where to put writable data.
 ///
 /// Order of precedence:
-///   1. `LANCHAT_HOME` env var (any dir).
-///   2. OS app-data dir + `"LanChat"`:
-///        Windows : %APPDATA%\LanChat
-///        macOS   : ~/Library/Application Support/LanChat
-///        Linux   : ~/.local/share/LanChat
-///   3. Fallback: a `lanchat-data/` folder next to the exe.
+///   1. `LOCALCHAT_HOME` env var (any dir).
+///   2. OS app-data dir + `"LocalChat"`:
+///        Windows : %APPDATA%\LocalChat
+///        macOS   : ~/Library/Application Support/LocalChat
+///        Linux   : ~/.local/share/LocalChat
+///   3. Fallback: a `localchat-data/` folder next to the exe.
 fn resolve_app_root() -> PathBuf {
-    if let Ok(p) = std::env::var("LANCHAT_HOME") {
+    if let Ok(p) = std::env::var("LOCALCHAT_HOME") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
     if let Some(d) = dirs::data_dir() {
-        return d.join("LanChat");
+        return d.join("LocalChat");
     }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    exe_dir.join("lanchat-data")
+    exe_dir.join("localchat-data")
 }
 
 /// One-shot migration from the old layout (config + uploads/ + history/
@@ -158,7 +158,7 @@ fn migrate_legacy_layout(
     if exe_dir == new_root {
         return;
     }
-    let old_cfg = exe_dir.join("lanchat-config.json");
+    let old_cfg = exe_dir.join("localchat-config.json");
     if old_cfg.exists() {
         let _ = std::fs::copy(&old_cfg, new_config);
     }

@@ -20,7 +20,7 @@ pub fn run_event_loop(state: Arc<AppState>, port: u16) {
     let open_chat = MenuItem::new("Open chat in browser", true, None);
     let copy_link = MenuItem::new("Copy LAN link", true, None);
     let open_admin = MenuItem::new("Open admin dashboard", true, None);
-    let quit = MenuItem::new("Quit LanChat", true, None);
+    let quit = MenuItem::new("Quit LocalChat", true, None);
 
     let _ = menu.append(&open_chat);
     let _ = menu.append(&copy_link);
@@ -33,7 +33,7 @@ pub fn run_event_loop(state: Arc<AppState>, port: u16) {
     let tray_result = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)
-        .with_tooltip(format!("LanChat • port {port}"))
+        .with_tooltip(format!("LocalChat • port {port}"))
         .build();
 
     // Keep the tray alive for the whole loop.
