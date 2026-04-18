@@ -1,8 +1,12 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0b141a" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#f0f2f5" media="(prefers-color-scheme: light)" />
   <title>LocalChat</title>
   <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236366f1'/%3E%3Cpath d='M10 10h3v10h7v3H10z' fill='white'/%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
@@ -22,10 +26,9 @@
     })();
     // Apply saved theme before paint to avoid flash.
     (function () {
-      var saved = localStorage.getItem("localchat-theme");
-      var mql = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
-      var theme = saved || (mql && mql.matches ? "light" : "dark");
-      document.documentElement.setAttribute("data-theme", theme);
+      // Dark mode is disabled; always use light.
+      document.documentElement.setAttribute("data-theme", "light");
+      try { localStorage.setItem("localchat-theme", "light"); } catch (e) {}
     })();
   </script>
 </head>
@@ -65,7 +68,7 @@
           <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 2l3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
           <span>End-to-end encrypted direct messages</span>
         </span>
-        <button type="button" id="themeToggleJoin" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()"></button>
+        <button type="button" id="themeToggleJoin" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()" hidden></button>
       </div>
     </div>
   </div>
@@ -138,7 +141,7 @@
             <svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 10V7a6 6 0 0112 0v3M5 10h14v10H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
             E2EE
           </span>
-          <button id="themeToggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()"></button>
+          <button id="themeToggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()" hidden></button>
         </div>
       </header>
 

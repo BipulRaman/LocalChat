@@ -179,6 +179,7 @@ const S = {
   channels: new Map(),     // id → meta
   msgs: new Map(),         // channelId → array of wire messages (raw)
   reactions: new Map(),    // channelId → Map<msgId, Map<emoji, Set<userId>>>
+  readMarks: new Map(),    // channelId → Map<userId, latestReadMsgId>
   unread: new Map(),       // channelId → count
   typing: new Map(),       // channelId → Map<userId, { username, until }>
   active: "pub:general",
@@ -192,6 +193,18 @@ const S = {
 // ── Boot ─────────────────────────────────────────────────────────────
 (async function boot() {
   try { await E2EE.init(); } catch (e) { console.warn("E2EE init failed", e); }
+
+  // Track on-screen keyboard (mobile) via visualViewport so the layout
+  // shrinks correctly and the emoji popover/composer stay visible.
+  if (window.visualViewport) {
+    const setVV = () => {
+      const vv = window.visualViewport;
+      document.documentElement.style.setProperty("--vv-h", `${vv.height}px`);
+    };
+    setVV();
+    window.visualViewport.addEventListener("resize", setVV);
+    window.visualViewport.addEventListener("scroll", setVV);
+  }
   fetch("/api/info").then((r) => r.json()).then((info) => {
     S.hostname = info.hostname || "";
     const h = $("hostInfo"); if (h) h.textContent = `host: ${S.hostname}`;
@@ -319,6 +332,8 @@ function onUsers(list) {
   $("userCount").textContent = `${list.length} online`;
   renderMembers();
   renderChannels();
+  // Presence change can flip ticks from sent→delivered; refresh the visible stream.
+  renderStream();
 }
 
 async function onWireMsg(m) {
@@ -335,6 +350,10 @@ async function onWireMsg(m) {
     try { onReact(JSON.parse(m.text)); } catch {}
     return;
   }
+  if (m.username === "__read") {
+    try { onRead(JSON.parse(m.text)); } catch {}
+    return;
+  }
   // Suppress noisy join/leave system messages.
   if (m.kind === "system" && /\b(joined|left) the chat\b/.test(m.text || "")) {
     return;
@@ -347,7 +366,11 @@ async function onWireMsg(m) {
     S.unread.set(m.channel, (S.unread.get(m.channel) || 0) + 1);
     renderChannels();
   } else {
+    // Force-scroll if the new message is from us, or if we're already near bottom.
+    const isMine = S.me && (m.userId === S.me.id || m.username === S.me.username);
+    if (isMine) $("messages").dataset.activeChannel = "__force";
     await renderStream();
+    if (!isMine) scheduleReadReceipt();
   }
 }
 
@@ -394,6 +417,42 @@ function toggleReaction(msgId, emoji) {
     msgId,
     emoji,
   }));
+}
+
+// Read receipts: S.readMarks: Map<channelId, Map<userId, msgId>>
+function onRead({ channel, userId, msgId }) {
+  if (!channel || msgId == null || userId == null) return;
+  let perCh = S.readMarks.get(channel);
+  if (!perCh) { perCh = new Map(); S.readMarks.set(channel, perCh); }
+  const cur = perCh.get(userId) || 0;
+  if (msgId > cur) perCh.set(userId, msgId);
+  if (channel === S.active) renderStream();
+}
+
+let _readSendTimer = null;
+function sendReadReceipt() {
+  if (!S.ws || S.ws.readyState !== 1) return;
+  if (document.hidden) return;
+  const arr = S.msgs.get(S.active) || [];
+  // Find latest non-system message id authored by someone else.
+  let latest = 0;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const m = arr[i];
+    if (m.kind === "system") continue;
+    if (m.userId === S.me?.id) continue;
+    if (m.id > latest) { latest = m.id; break; }
+  }
+  if (latest === 0) return;
+  // Suppress if we've already marked this or higher locally.
+  const myReads = S.readMarks.get(S.active);
+  const mine = myReads?.get(S.me?.id) || 0;
+  if (latest <= mine) return;
+  if (myReads) myReads.set(S.me.id, latest); else S.readMarks.set(S.active, new Map([[S.me.id, latest]]));
+  S.ws.send(JSON.stringify({ op: "read", channel: S.active, msgId: latest }));
+}
+function scheduleReadReceipt() {
+  clearTimeout(_readSendTimer);
+  _readSendTimer = setTimeout(sendReadReceipt, 350);
 }
 
 function onChannelCreated(ch) {
@@ -492,7 +551,9 @@ function renderMembers() {
 
 async function renderStream() {
   const box = $("messages");
-  const atBottom = isAtBottom(box);
+  const force = box.dataset.activeChannel !== S.active;
+  const atBottom = force ? true : isAtBottom(box);
+  box.dataset.activeChannel = S.active;
   box.innerHTML = "";
   const arr = S.msgs.get(S.active) || [];
   const ch = S.channels.get(S.active);
@@ -526,7 +587,15 @@ async function renderStream() {
     prev = m;
   }
   updateHeader();
-  if (atBottom) box.scrollTop = box.scrollHeight;
+  if (atBottom) {
+    // Snap to bottom now and after layout / image loads settle.
+    const snap = () => { box.scrollTop = box.scrollHeight; };
+    snap();
+    requestAnimationFrame(snap);
+    box.querySelectorAll("img").forEach((img) => {
+      if (!img.complete) img.addEventListener("load", snap, { once: true });
+    });
+  }
 }
 
 function renderEmptyState(ch) {
@@ -643,7 +712,7 @@ async function renderMessage(m, { follow, peer, ch }) {
     metaChildren.push(el("span", { class: "enc-tag", title: "End-to-end encrypted" },
       svg("M6 10V7a6 6 0 0112 0v3M5 10h14v10H5z", 10, 2)));
   }
-  if (isOwn) metaChildren.push(renderTicks("sent"));
+  if (isOwn) metaChildren.push(renderTicks(computeTickState(m, ch)));
   if (metaChildren.length) bubble.append(el("div", { class: "meta" }, metaChildren));
 
   // Reaction bar (rendered below the text inside bubble) + hover quick-add.
@@ -697,10 +766,34 @@ async function renderMessage(m, { follow, peer, ch }) {
   return el("div", { class: classes.join(" ") }, [avatar, stack]);
 }
 
+// Compute tick state for an own message:
+//   "sent"      → message is in the room, no other connected peer.
+//   "delivered" → at least one other channel member is currently online.
+//   "read"      → at least one other channel member has read up to this msg.
+function computeTickState(m, ch) {
+  if (!ch || !m || !S.me) return "sent";
+  // Read?
+  const reads = S.readMarks.get(m.channel);
+  if (reads) {
+    for (const [uid, lastId] of reads.entries()) {
+      if (uid === S.me.id) continue;
+      if (lastId >= m.id) return "read";
+    }
+  }
+  // Delivered? Any other online user who can see this channel.
+  const memberSet = ch.members && ch.members.length
+    ? new Set(ch.members)
+    : null; // lobby/general → everyone counts
+  for (const uid of S.users.keys()) {
+    if (uid === S.me.id) continue;
+    if (!memberSet || memberSet.has(uid)) return "delivered";
+  }
+  return "sent";
+}
+
 // WhatsApp-style ticks. Single grey = sent; double grey = delivered; double blue = read.
-// Without a delivery protocol yet, all own messages render as "sent".
 function renderTicks(state) {
-  const cls = "ticks" + (state === "read" ? " read" : "");
+  const cls = "ticks " + state;
   if (state === "sent") {
     return el("span", {
       class: cls,
@@ -798,7 +891,7 @@ function renderTyping() {
 setInterval(renderTyping, 1500);
 
 function isAtBottom(box) {
-  return box.scrollTop + box.clientHeight > box.scrollHeight - 80;
+  return box.scrollTop + box.clientHeight > box.scrollHeight - 160;
 }
 
 // ── Channel switching ────────────────────────────────────────────────
@@ -810,6 +903,7 @@ function switchChannel(id) {
   renderTyping();
   if (!S.hasHistory.has(id)) sendOp({ op: "history", channel: id, limit: 50 });
   renderStream();
+  scheduleReadReceipt();
   $("msgInput").focus();
   if (window.matchMedia("(max-width: 780px)").matches) $("sidebar").classList.remove("open");
 }
@@ -949,6 +1043,23 @@ function openDmPicker() {
 }
 
 function toggleSidebar() { $("sidebar").classList.toggle("open"); }
+// Auto-close mobile sidebar on outside tap / Escape.
+document.addEventListener("click", (e) => {
+  const sb = $("sidebar");
+  if (!sb || !sb.classList.contains("open")) return;
+  if (!window.matchMedia("(max-width: 780px)").matches) return;
+  if (e.target.closest("#sidebar")) return;
+  if (e.target.closest('[onclick*="toggleSidebar"]')) return;
+  sb.classList.remove("open");
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("sidebar")?.classList.remove("open");
+});
+// Re-confirm read state when the tab becomes visible again.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleReadReceipt();
+});
+window.addEventListener("focus", scheduleReadReceipt);
 
 function signOut() {
   localStorage.removeItem("localchat-username");
@@ -1007,6 +1118,11 @@ function toggleEmoji() {
 function openEmoji() {
   closeEmoji();
   _emojiOpen = true;
+  // On touch / small screens, dismiss the on-screen keyboard so the
+  // popover isn't hidden behind it.
+  if (window.matchMedia("(max-width: 780px)").matches) {
+    try { document.activeElement?.blur?.(); } catch {}
+  }
   const pop = el("div", { class: "emoji-pop", id: "emojiPop" });
   pop.addEventListener("click", (e) => e.stopPropagation());
 
@@ -1080,6 +1196,11 @@ $("emojiBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleEmoj
 document.addEventListener("click", (e) => {
   if (_emojiOpen && !e.target.closest("#emojiPop") && e.target.id !== "emojiBtn") closeEmoji();
 });
+// Close emoji panel when the user refocuses the textarea (e.g. taps to type again).
+$("msgInput").addEventListener("focus", () => { if (_emojiOpen) closeEmoji(); });
+// Also close on Escape and when window loses focus (mobile keyboard switching).
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && _emojiOpen) closeEmoji(); });
+window.addEventListener("blur", () => { if (_emojiOpen) closeEmoji(); });
 
 // ── Paste image / drag-drop ──────────────────────────────────────────
 async function uploadFile(f) {

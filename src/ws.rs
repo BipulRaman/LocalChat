@@ -679,6 +679,44 @@ async fn handle_op(
             let _ = sink.send(Message::Text(r#"{"ev":"pong"}"#.into())).await;
         }
 
+        "read" => {
+            let channel_id = v
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or("missing channel")?
+                .to_compact_string();
+            let msg_id = v.get("msgId").and_then(Value::as_u64).ok_or("missing msgId")?;
+            let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
+            if !can_send(&ch, user_id) { return Err("not a member".into()); }
+            let username = state
+                .users
+                .get(&user_id)
+                .map(|e| e.value().username.to_string())
+                .unwrap_or_default();
+            let ev = json!({
+                "ev": "read",
+                "channel": channel_id,
+                "msgId": msg_id,
+                "userId": user_id,
+                "username": username,
+            });
+            let _ = ch.tx.send(Arc::new(WireMsg {
+                id: 0,
+                channel: ch.id.clone(),
+                kind: MsgKind::System,
+                user_id,
+                username: CompactString::const_new("__read"),
+                avatar: CompactString::const_new(""),
+                color: CompactString::const_new(""),
+                ts: now_secs(),
+                text: ev.to_string(),
+                file: None,
+                reply_to: None,
+                edited_at: None,
+                deleted: false,
+            }));
+        }
+
         _ => return Err(format!("unknown op '{op}'")),
     }
 
