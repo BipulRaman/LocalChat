@@ -4,8 +4,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
@@ -17,33 +18,8 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: --features tray
-            artifact: LocalChat-windows-x64.exe
-            bin: LocalChat.exe
-
-          - name: Windows x86 (32-bit)
-            runner: windows-latest
-            target: i686-pc-windows-msvc
-            features: --features tray
-            artifact: LocalChat-windows-x86.exe
-            bin: LocalChat.exe
-
-          - name: Windows arm64
-            runner: windows-latest
-            target: aarch64-pc-windows-msvc
-            features: --features tray
-            artifact: LocalChat-windows-arm64.exe
-            bin: LocalChat.exe
-
+    name: Windows x64
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,26 +28,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: x86_64-pc-windows-msvc
+          workspaces: app
 
       - name: Build
         shell: bash
+        working-directory: app
         run: |
-          cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
-
+          cargo build --release --target x86_64-pc-windows-msvc --features tray
 
       - name: Collect & size check
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          cp "app/target/x86_64-pc-windows-msvc/release/localchat.exe" "dist/LocalChat.exe"
           ls -la dist
-          size=$(wc -c < "dist/${{ matrix.artifact }}")
+          size=$(wc -c < "dist/LocalChat.exe")
           echo "Binary size: $size bytes"
           # Soft ceiling: 15 MB. Bump if needed, but keep an eye on bloat.
           test "$size" -lt 15728640
@@ -79,8 +56,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          name: LocalChat.exe
+          path: dist/LocalChat.exe
           if-no-files-found: error
           retention-days: 14
 

@@ -12,9 +12,13 @@ LAN URL with anyone on the same Wi-Fi.
 - **Memory negligible** (~5 MB RSS at 200 users / 50 channels)
 - **Private by default** — LAN only, no internet, no accounts, no telemetry
 
+## Screenshots
+
+![LocalChat](LocalChat.png)
+
 ## For end users (hosting the chat)
 
-1. Download the Windows binary (x64, x86, or arm64) from [Releases](../../releases).
+1. Download `LocalChat.exe` from [Releases](../../releases).
 2. Double-click it.
 3. A tray icon appears. Right-click → "Open chat in browser" (or wait —
    it auto-opens the host's browser). The LAN URL is shown in the tray
@@ -43,8 +47,11 @@ access" in Settings to access it from other devices (still token-gated).
 
 ## For developers
 
+All source lives under [`app/`](app/). Run from the repo root:
+
 ```bash
-cargo run --release                  # run locally; web UI at http://localhost:5000
+cd app
+cargo run --release                         # run locally; web UI at https://localhost:<port>
 cargo run --release --no-default-features   # headless (no tray, console banner)
 ```
 
@@ -56,48 +63,47 @@ port. Override with `PORT=xxxx` env or `--port=xxxx`.
 
 ```
 LocalChat/
-├─ Cargo.toml
-├─ src/
-│  ├─ main.rs         # entry: tokio runtime + tray event loop
-│  ├─ state.rs        # AppState (users, channels, metrics, config)
-│  ├─ config.rs       # Config (loaded from LocalChat-config.json)
-│  ├─ user.rs         # UserInfo
-│  ├─ message.rs      # WireMsg, MsgKind, FileInfo
-│  ├─ channel.rs      # Channel, DM/group/lobby, broadcast bus
-│  ├─ ws.rs           # WebSocket handler (op/ev protocol)
-│  ├─ http.rs         # axum routes + embedded asset server
-│  ├─ admin.rs        # /api/admin/* — token-gated
-│  ├─ metrics.rs      # lock-free atomic counters
-│  ├─ persist.rs      # append-only JSONL per channel
-│  ├─ net.rs          # port picker + LAN IP enum + banner
-│  └─ tray.rs         # tray-icon + menu + event loop
-├─ web/               # embedded into the binary via rust-embed
-│  ├─ index.html      # chat UI
-│  ├─ admin.html      # admin dashboard
-│  ├─ app.js          # chat client (vanilla JS)
-│  ├─ admin.js        # admin client
-│  └─ style.css
-└─ .github/workflows/build.yml
+├─ README.md
+├─ .github/workflows/build.yml   # CI (Windows x64/x86/arm64)
+└─ app/                          # all application code
+   ├─ .gitignore
+   ├─ Cargo.toml
+   ├─ Cargo.lock
+   ├─ src/
+   │  ├─ main.rs         # entry: tokio runtime + tray event loop
+   │  ├─ state.rs        # AppState (users, channels, metrics, config)
+   │  ├─ config.rs       # Config (loaded from LocalChat-config.json)
+   │  ├─ user.rs         # UserInfo
+   │  ├─ message.rs      # WireMsg, MsgKind, FileInfo
+   │  ├─ channel.rs      # Channel, DM/group/lobby, broadcast bus
+   │  ├─ ws.rs           # WebSocket handler (op/ev protocol)
+   │  ├─ http.rs         # axum routes + embedded asset server
+   │  ├─ admin.rs        # /api/admin/* — token-gated
+   │  ├─ metrics.rs      # lock-free atomic counters
+   │  ├─ persist.rs      # append-only JSONL per channel
+   │  ├─ net.rs          # port picker + LAN IP enum + banner
+   │  └─ tray.rs         # tray-icon + menu + event loop
+   ├─ web/              # embedded into the binary via rust-embed
+   │  ├─ index.html      # chat UI
+   │  ├─ admin.html      # admin dashboard
+   │  ├─ app.js          # chat client (vanilla JS)
+   │  ├─ admin.js        # admin client
+   │  └─ style.css
+   └─ scripts/          # optional: TLS cert issue/renew, autostart
 ```
 
-### Building Windows binaries locally
+### Building the Windows binary locally
+
+From the `app/` folder:
 
 ```bash
-# Native x64 (from Windows host)
 cargo build --release --features tray
-
-# 32-bit x86
-rustup target add i686-pc-windows-msvc
-cargo build --release --target i686-pc-windows-msvc --features tray
-
-# arm64
-rustup target add aarch64-pc-windows-msvc
-cargo build --release --target aarch64-pc-windows-msvc --features tray
+# → app/target/release/localchat.exe
 ```
 
 CI (see [.github/workflows/build.yml](.github/workflows/build.yml))
-builds all three Windows architectures (x64, x86, arm64) in parallel on
-push/PR, and publishes a Release when you push a `v*` tag:
+builds a single `LocalChat.exe` (Windows x64) and publishes a Release
+when you push a `v*` tag:
 
 ```bash
 git tag v2.0.0 && git push origin v2.0.0
