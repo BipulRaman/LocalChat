@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LanChat</title>
+  <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236366f1'/%3E%3Cpath d='M10 10h3v10h7v3H10z' fill='white'/%3E%3C/svg%3E"/>
+  <link rel="stylesheet" href="/style.css"/>
+  <script>
+    // Apply saved theme before paint to avoid flash.
+    (function () {
+      var saved = localStorage.getItem("lanchat-theme");
+      var mql = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
+      var theme = saved || (mql && mql.matches ? "light" : "dark");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+</head>
+<body>
+  <!-- ═══════════════════ JOIN SCREEN ═══════════════════ -->
+  <div id="join" class="screen-join">
+    <div class="join-panel">
+      <div class="join-brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 32 32" width="40" height="40" aria-hidden="true">
+            <rect width="32" height="32" rx="8" fill="url(#g)"/>
+            <path d="M10 10h3v10h7v3H10z" fill="white"/>
+            <defs><linearGradient id="g" x1="0" y1="0" x2="32" y2="32">
+              <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
+            </linearGradient></defs>
+          </svg>
+        </div>
+        <h1>LanChat</h1>
+        <p class="muted">Private messaging for your local network</p>
+      </div>
+
+      <form id="joinForm" class="join-form">
+        <label class="field">
+          <span>Your display name</span>
+          <input id="username" type="text" maxlength="30" required
+                 autocomplete="off" spellcheck="false" placeholder="e.g. Alice"/>
+        </label>
+        <button class="btn btn-primary btn-lg" type="submit">
+          Enter chat
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M5 12h14M13 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="joinStatus" class="join-status"></div>
+      </form>
+
+      <div class="join-foot muted">
+        <span class="foot-left">
+          <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 2l3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          <span>End-to-end encrypted direct messages</span>
+        </span>
+        <button type="button" id="themeToggleJoin" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ MAIN APP ═══════════════════ -->
+  <div id="app" class="app hidden">
+    <!-- ───────── Sidebar ───────── -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sb-header">
+        <div class="sb-brand">
+          <div class="brand-mark sm">
+            <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+              <rect width="32" height="32" rx="8" fill="url(#g2)"/>
+              <path d="M10 10h3v10h7v3H10z" fill="white"/>
+              <defs><linearGradient id="g2" x1="0" y1="0" x2="32" y2="32">
+                <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/>
+              </linearGradient></defs>
+            </svg>
+          </div>
+          <div class="sb-title">
+            <div class="h6">LanChat</div>
+            <div class="muted xs" id="hostInfo">connecting…</div>
+          </div>
+        </div>
+        <span class="status-pill" id="statusPill" title="Connection status">
+          <span class="dot"></span><span class="txt">offline</span>
+        </span>
+      </div>
+
+      <nav class="sb-scroll">
+        <div class="sb-tabs" role="tablist">
+          <button type="button" class="sb-tab active" data-tab="all"      onclick="setSidebarTab('all')">All</button>
+          <button type="button" class="sb-tab"        data-tab="channels" onclick="setSidebarTab('channels')">Channels</button>
+          <button type="button" class="sb-tab"        data-tab="dms"      onclick="setSidebarTab('dms')">Direct messages</button>
+        </div>
+
+        <div class="sb-actions">
+          <button class="sb-action" onclick="openCreateChannel()" title="New channel">
+            <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            New channel
+          </button>
+          <button class="sb-action" onclick="openDmPicker()" title="New direct message">
+            <svg viewBox="0 0 24 24" width="14" height="14"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            New DM
+          </button>
+        </div>
+
+        <ul id="chatList" class="chat-list"></ul>
+      </nav>
+
+      <div class="sb-foot">
+        <div class="me-chip" id="meChip"></div>
+      </div>
+    </aside>
+
+    <!-- ───────── Main panel ───────── -->
+    <main class="main">
+      <header class="chat-header">
+        <button class="icon-btn mobile-only" onclick="toggleSidebar()" aria-label="Toggle sidebar">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 6h18M3 12h18M3 18h18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+        <div class="ch-avatar" id="chAvatar">#</div>
+        <div class="ch-title">
+          <div class="h5" id="chTitle">general</div>
+          <div class="muted xs" id="chSub">lobby</div>
+        </div>
+        <div class="ch-actions">
+          <span class="badge" id="userCount">0 online</span>
+          <span class="badge badge-secure hidden" id="e2eeBadge" title="End-to-end encrypted">
+            <svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 10V7a6 6 0 0112 0v3M5 10h14v10H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            E2EE
+          </span>
+          <button id="themeToggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()"></button>
+        </div>
+      </header>
+
+      <div id="messages" class="chat-stream" role="log" aria-live="polite"></div>
+
+      <div id="typing" class="typing-row"></div>
+
+      <form id="sendForm" class="composer" autocomplete="off">
+        <textarea id="msgInput" rows="1" placeholder="Message #general…" maxlength="4000"></textarea>
+        <button type="button" class="emoji-btn" id="emojiBtn" title="Emoji" aria-label="Emoji">
+          <span aria-hidden="true">😊</span>
+        </button>
+        <label class="attach-btn" title="Attach file or image">
+          <input id="fileInput" type="file" hidden accept="*/*" />
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.5 3.5 0 115 5l-8.5 8.5a2 2 0 01-3-3L15 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </label>
+        <button type="submit" class="send-btn" title="Send (Enter)" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M3 11l18-8-8 18-2-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        </button>
+      </form>
+    </main>
+  </div>
+
+  <!-- ═══════════════════ MODALS ═══════════════════ -->
+  <div id="createModal" class="modal hidden" role="dialog" aria-labelledby="cmTitle">
+    <form class="modal-panel" onsubmit="createChannel(event)">
+      <header class="modal-head">
+        <h3 id="cmTitle">Create channel</h3>
+        <button type="button" class="icon-btn" onclick="closeModal('createModal')" aria-label="Close">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <label class="field">
+          <span>Channel name</span>
+          <input id="newChName" type="text" maxlength="40" required placeholder="e.g. dev-team" autocomplete="off"/>
+        </label>
+        <label class="checkbox">
+          <input id="newChPrivate" type="checkbox"/>
+          <span><strong>Private</strong> — invite-only. Other members can't see it in the list.</span>
+        </label>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" onclick="closeModal('createModal')">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </footer>
+    </form>
+  </div>
+
+  <div id="dmModal" class="modal hidden" role="dialog" aria-labelledby="dmTitle">
+    <div class="modal-panel">
+      <header class="modal-head">
+        <h3 id="dmTitle">Direct message</h3>
+        <button type="button" class="icon-btn" onclick="closeModal('dmModal')" aria-label="Close">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="muted sm">Messages are encrypted end-to-end. Not even the server admin can read them.</p>
+        <ul id="dmPickList" class="pick-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ TOAST ═══════════════════ -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

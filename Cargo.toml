@@ -1,0 +1,90 @@
+[package]
+name        = "lanchat"
+version     = "2.0.0"
+edition     = "2021"
+rust-version = "1.75"
+description = "LAN Instant Messenger — self-contained, tray-only, ultra-light"
+license     = "MIT"
+default-run = "lanchat"
+
+[[bin]]
+name = "lanchat"
+path = "src/main.rs"
+
+# ─── Ultra-slim release profile ──────────────────────────────────────
+[profile.release]
+opt-level     = "z"
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+overflow-checks = false
+incremental   = false
+
+[profile.release-fast]
+inherits  = "release"
+opt-level = 3
+
+[dependencies]
+# Runtime
+tokio = { version = "1.40", default-features = false, features = [
+    "rt-multi-thread", "net", "fs", "sync", "macros", "signal",
+    "io-util", "time",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# Web server
+axum = { version = "0.7", default-features = false, features = [
+    "http1", "json", "ws", "query", "matched-path", "tokio", "multipart",
+] }
+tower-http = { version = "0.6", default-features = false, features = [
+    "cors", "trace",
+] }
+hyper = { version = "1", default-features = false }
+
+# Serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", default-features = false, features = ["std"] }
+
+# Small, efficient data structures
+bytes       = "1"
+compact_str = { version = "0.8", features = ["serde"] }
+dashmap     = "6"
+smallvec    = { version = "1", features = ["const_generics", "serde"] }
+arrayvec    = { version = "0.7", features = ["serde"] }
+
+# Utility
+uuid        = { version = "1", default-features = false, features = ["v4", "fast-rng", "serde"] }
+time        = { version = "0.3", default-features = false, features = ["std", "formatting", "serde"] }
+rand        = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+# Embedded static assets (the entire web/ folder)
+rust-embed  = { version = "8", features = ["compression"] }
+mime_guess  = "2"
+
+# Platform / LAN helpers
+local-ip-address = "0.6"
+opener      = "0.7"
+dirs        = "5"
+
+# Allocator — drops RSS significantly
+mimalloc    = { version = "0.1", default-features = false }
+
+# Tray icon (optional — on by default on Windows/macOS/Linux desktops)
+tray-icon   = { version = "0.19", optional = true }
+tao         = { version = "0.30", optional = true }
+image       = { version = "0.25", default-features = false, features = ["png"], optional = true }
+arboard     = { version = "3", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg      = { version = "0.52", optional = true }
+
+[features]
+# `tray` is the default on desktop builds. Disable with
+#   cargo build --release --no-default-features
+# to produce a headless console-only binary.
+default = ["tray"]
+tray    = ["dep:tray-icon", "dep:tao", "dep:image", "dep:arboard", "dep:winreg"]
+
+[build-dependencies]
+# Nothing yet. Reserved for Windows resource embedding (icon) later.
