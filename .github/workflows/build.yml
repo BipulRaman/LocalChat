@@ -64,9 +64,14 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -78,10 +83,38 @@ jobs:
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
 
-      - name: Create Release
+      - name: Compute next version
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Tag push: use the tag as-is.
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            # Auto-bump patch from the highest existing vMAJOR.MINOR.PATCH tag.
+            git fetch --tags --force >/dev/null 2>&1 || true
+            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+              | sort -V \
+              | tail -n1)
+            if [[ -z "$LATEST" ]]; then
+              TAG="v0.1.0"
+            else
+              IFS='.' read -r MA MI PA <<< "${LATEST#v}"
+              TAG="v${MA}.${MI}.$((PA + 1))"
+            fi
+          fi
+          echo "Selected tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true
           draft: false
           prerelease: false
+          make_latest: true
