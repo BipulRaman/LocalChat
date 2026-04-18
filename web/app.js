@@ -10,6 +10,19 @@
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Stable avatar color from a username — mirrors server's pick_color_for (FNV-1a 32, lowercased).
+const _AVATAR_COLORS = ["#6366f1","#8b5cf6","#ec4899","#ef4444","#f97316","#eab308","#22c55e","#14b8a6","#06b6d4","#3b82f6"];
+function colorForName(name) {
+  if (!name) return _AVATAR_COLORS[0];
+  let h = 0x811c9dc5 >>> 0;
+  const s = name.toLowerCase();
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return _AVATAR_COLORS[h % _AVATAR_COLORS.length];
+}
+
 function el(tag, attrs = {}, children = []) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -200,7 +213,8 @@ const S = {
   typingTimer: null,
   reconnectTries: 0,
   hostname: "",
-  sidebarTab: "all",
+  sidebarTab: "mine",
+  sidebarFilter: "",
 };
 
 // ── Boot ─────────────────────────────────────────────────────────────
@@ -286,6 +300,7 @@ function handleEvent(e) {
     case "history":      return onHistory(e);
     case "react":        return onReact(e);
     case "ch_created":   return onChannelCreated(e.channel);
+    case "ch_deleted":   return onChannelDeleted(e.channel);
     case "error":        return onError(e);
     case "pong":         return;
     default:             console.debug("[ev]", e);
@@ -323,15 +338,23 @@ function onWelcome(e) {
       el("div", { class: "id" }, `#${e.user.id}`),
     ]),
     el("button", {
+      id: "themeToggle",
+      class: "icon-btn", title: "Toggle theme", "aria-label": "Toggle theme",
+      onclick: toggleTheme,
+    }),
+    el("button", {
       class: "icon-btn", title: "Sign out", "aria-label": "Sign out",
       onclick: signOut,
       html: `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M15 17l5-5-5-5M20 12H9M12 19H5a2 2 0 01-2-2V7a2 2 0 012-2h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
     }),
   );
 
+  updateThemeIcon();
+
   renderChannels();
   renderMembers();
   switchChannel(e.lobby || "pub:general");
+  S.lobby = e.lobby || "pub:general";
 }
 
 function onUsers(list) {
@@ -344,7 +367,7 @@ function onUsers(list) {
   }
   S.users.clear();
   for (const u of list) S.users.set(u.id, u);
-  $("userCount").textContent = `${list.length} online`;
+  const uc = $("userCount"); if (uc) uc.textContent = "";
   renderMembers();
   renderChannels();
   // Presence change can flip ticks from sent→delivered; refresh the visible stream.
@@ -371,6 +394,13 @@ async function onWireMsg(m) {
   }
   if (m.username === "__call") {
     try { onCallSignal(JSON.parse(m.text)); } catch {}
+    return;
+  }
+  if (m.username === "__dm_deleted") {
+    try {
+      const id = JSON.parse(m.text).channel || m.channel;
+      onChannelDeleted(id);
+    } catch {}
     return;
   }
   // Suppress noisy join/leave system messages.
@@ -480,6 +510,20 @@ function onChannelCreated(ch) {
   switchChannel(ch.id);
 }
 
+function onChannelDeleted(id) {
+  S.channels.delete(id);
+  S.msgs.delete(id);
+  S.unread.delete(id);
+  S.typing.delete(id);
+  if (S.active === id) {
+    // Fall back to lobby (or first remaining channel).
+    const fallback = S.lobby || [...S.channels.keys()][0];
+    if (fallback) switchChannel(fallback);
+    else { S.active = null; renderStream(); updateHeader(); }
+  }
+  renderChannels();
+}
+
 function onTyping({ channel, userId, username, typing }) {
   if (userId === S.me?.id) return;
   let m = S.typing.get(channel); if (!m) { m = new Map(); S.typing.set(channel, m); }
@@ -490,67 +534,198 @@ function onTyping({ channel, userId, username, typing }) {
 
 // ── Rendering ────────────────────────────────────────────────────────
 
+// Collapsed state for sidebar groups, persisted across reloads.
+const SB_COLLAPSE_KEY = "localchat-sb-collapsed";
+const _sbCollapsed = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(SB_COLLAPSE_KEY) || "[]")); }
+  catch { return new Set(); }
+})();
+function _sbToggle(key, open) {
+  if (open) _sbCollapsed.delete(key); else _sbCollapsed.add(key);
+  localStorage.setItem(SB_COLLAPSE_KEY, JSON.stringify([..._sbCollapsed]));
+}
+
+function _sbGroup(key, title, count, items) {
+  const open = !_sbCollapsed.has(key);
+  const det = el("details", { class: "sb-group", open: open ? "" : null });
+  const sum = el("summary", { class: "sb-group-head" }, [
+    el("span", { class: "sb-caret", html: `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>` }),
+    el("span", { class: "sb-group-title" }, title),
+  ]);
+  det.append(sum);
+  if (!open) det.removeAttribute("open");
+  det.addEventListener("toggle", () => _sbToggle(key, det.open));
+  const ul = el("ul", { class: "chat-list" });
+  for (const it of items) ul.append(it);
+  det.append(ul);
+  return det;
+}
+
+function _channelItem(c) {
+  const active = c.id === S.active ? "active" : "";
+  const unread = S.unread.get(c.id) || 0;
+  return el("li", {
+    class: "chat-item " + active,
+    onclick: () => switchChannel(c.id),
+  }, [
+    el("div", { class: "avatar", style: `background:var(--brand)` }, "#"),
+    el("div", { class: "chat-meta" }, [
+      el("div", { class: "chat-name" }, c.name || c.id),
+      el("div", { class: "chat-sub muted xs" },
+        c.kind === "lobby" ? "lobby \u00b7 everyone" : (c.isPrivate ? "private channel" : "channel")),
+    ]),
+    unread ? el("span", { class: "badge badge-unread" }, String(unread)) : null,
+  ]);
+}
+
+function _dmItem(c) {
+  const u = dmPeer(c);
+  const active = c.id === S.active ? "active" : "";
+  const unread = S.unread.get(c.id) || 0;
+  const online = !!(u && !u.offline);
+  const peerName = u ? u.username : "unknown";
+  const askDelete = (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    confirmDialog({
+      title: "Delete conversation",
+      body: `Delete your conversation with ${peerName}?\n\nThis removes the chat for both of you, including all messages. This cannot be undone.`,
+      okText: "Delete",
+    }).then((ok) => { if (ok) deleteDm(c.id); });
+  };
+  return el("li", {
+    class: "chat-item " + active,
+    onclick: () => switchChannel(c.id),
+    oncontextmenu: askDelete,
+  }, [
+    el("div", { class: `avatar ${online ? "avatar-online" : "avatar-offline"}`, style: `background:${u?.color || "var(--brand)"}` }, [
+      document.createTextNode(u?.avatar || (u?.username?.[0] || "?").toUpperCase()),
+      el("span", { class: "presence-dot" }),
+    ]),
+    el("div", { class: "chat-meta" }, [
+      el("div", { class: "chat-name" }, peerName),
+      el("div", { class: "chat-sub muted xs" }, online ? "online" : "offline"),
+    ]),
+    unread ? el("span", { class: "badge badge-unread" }, String(unread)) : null,
+    el("button", {
+      class: "chat-del",
+      title: `Delete conversation with ${peerName}`,
+      "aria-label": "Delete conversation",
+      onclick: askDelete,
+      html: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>`,
+    }),
+  ]);
+}
+
+function deleteDm(channelId) {
+  sendOp({ op: "dm_delete", channel: channelId });
+}
+
+function _personItem(u, online) {
+  return el("li", {
+    class: "chat-item",
+    title: online ? `Message ${u.username}` : `${u.username} (offline)`,
+    onclick: () => online && u.id != null
+      ? sendOp({ op: "dm_open", user: u.id })
+      : toast(`${u.username} is offline`),
+  }, [
+    el("div", { class: `avatar ${online ? "avatar-online" : "avatar-offline"}`, style: `background:${u.color || "var(--brand)"}` }, [
+      document.createTextNode(u.avatar || (u.username?.[0] || "?").toUpperCase()),
+      el("span", { class: "presence-dot" }),
+    ]),
+    el("div", { class: "chat-meta" }, [
+      el("div", { class: "chat-name" }, u.username),
+      el("div", { class: "chat-sub muted xs" }, online ? "online" : "offline"),
+    ]),
+  ]);
+}
+
 function renderChannels() {
-  const list = $("chatList");
-  if (!list) return;
-  list.innerHTML = "";
+  const root = $("sbGroups");
+  if (!root) return;
+  root.innerHTML = "";
+  const tab = S.sidebarTab || "mine";
+  const q = (S.sidebarFilter || "").trim().toLowerCase();
+  const matches = (s) => !q || (s || "").toLowerCase().includes(q);
 
-  const tab = S.sidebarTab || "all";
-
-  const items = [];
+  // ── Channels ─────────────────────────────────────────────
+  const channels = [];
   for (const c of S.channels.values()) {
-    if (c.kind === "dm") {
-      if (tab === "channels") continue;
-      const u = dmPeer(c);
-      items.push({
-        ch: c, kind: "dm",
-        name: u ? u.username : "unknown",
-        avatar: u?.avatar || "?",
-        color: u?.color || "var(--brand)",
-        sub: "end-to-end encrypted",
-        unread: S.unread.get(c.id) || 0,
-      });
-    } else {
-      if (tab === "dms") continue;
-      items.push({
-        ch: c, kind: "channel",
-        name: c.name || c.id,
-        avatar: "#",
-        color: "var(--brand)",
-        sub: c.kind === "lobby" ? "lobby \u00b7 everyone" : (c.isPrivate ? "private channel" : "channel"),
-        unread: S.unread.get(c.id) || 0,
+    if (c.kind === "dm") continue;
+    if (!matches(c.name || c.id)) continue;
+    channels.push(c);
+  }
+  channels.sort((a, b) => {
+    if (a.kind === "lobby") return -1;
+    if (b.kind === "lobby") return 1;
+    return (a.name || a.id).localeCompare(b.name || b.id);
+  });
+
+  // ── DM channels (used inside Online/Offline groups for unread + history) ──
+  const dmList = [...S.channels.values()].filter((c) => c.kind === "dm");
+
+  // ── People (online + offline) ────────────────────────────
+  const me = S.me;
+  const myName = (me?.username || "").toLowerCase();
+  const byName = new Map();
+  for (const u of S.users.values()) {
+    if (!me || u.id !== me.id) byName.set((u.username || "").toLowerCase(), { user: u, online: true });
+  }
+  for (const c of dmList) {
+    if (!c.dmUsers) continue;
+    for (const n of c.dmUsers) {
+      const ln = (n || "").toLowerCase();
+      if (!ln || ln === myName || byName.has(ln)) continue;
+      byName.set(ln, {
+        user: { username: n, color: colorForName(n), avatar: n[0]?.toUpperCase() || "?", offline: true },
+        online: false,
       });
     }
   }
+  const onlinePeople  = [...byName.values()].filter((x) =>  x.online && matches(x.user.username)).sort((a,b)=> a.user.username.localeCompare(b.user.username));
+  const offlinePeople = [...byName.values()].filter((x) => !x.online && matches(x.user.username)).sort((a,b)=> a.user.username.localeCompare(b.user.username));
 
-  items.sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === "channel" ? -1 : 1;
-    if (a.ch.kind === "lobby") return -1;
-    if (b.ch.kind === "lobby") return 1;
-    return a.name.localeCompare(b.name);
+  // For DM tab we want DM channels grouped by online/offline (since they're conversations)
+  const dmGroupedOnline  = dmList.filter((c) => {
+    const p = dmPeer(c); return !!(p && !p.offline) && matches(p?.username);
   });
+  const dmGroupedOffline = dmList.filter((c) => {
+    const p = dmPeer(c); return !(p && !p.offline) && matches(p?.username);
+  });
+  const sortDm = (a, b) => (dmPeer(a)?.username || "").localeCompare(dmPeer(b)?.username || "");
+  dmGroupedOnline.sort(sortDm); dmGroupedOffline.sort(sortDm);
 
-  for (const it of items) {
-    const active = it.ch.id === S.active ? "active" : "";
-    const li = el("li", {
-      class: "chat-item " + active,
-      onclick: () => switchChannel(it.ch.id),
-    }, [
-      el("div", { class: "avatar", style: `background:${it.color}` }, it.avatar),
-      el("div", { class: "chat-meta" }, [
-        el("div", { class: "chat-name" }, it.name),
-        el("div", { class: "chat-sub muted xs" }, it.sub),
-      ]),
-      it.unread ? el("span", { class: "badge badge-unread" }, String(it.unread)) : null,
-    ]);
-    list.append(li);
+  // ── Render based on tab ──────────────────────────────────
+  if (tab === "online") {
+    // Just online people — quick way to start a chat.
+    const items = onlinePeople.map((x) => {
+      // If a DM already exists with this peer, render the DM row (preserves unread).
+      const existing = dmGroupedOnline.find(
+        (c) => dmPeer(c)?.username?.toLowerCase() === x.user.username.toLowerCase()
+      );
+      return existing ? _dmItem(existing) : _personItem(x.user, true);
+    });
+    root.append(_sbGroup("online", "Online", items.length, items));
+  } else if (tab === "mine") {
+    // My channels and personal (DM) chats I've actually opened.
+    root.append(_sbGroup("ch", "Channels", channels.length, channels.map(_channelItem)));
+    const personal = [...dmGroupedOnline, ...dmGroupedOffline];
+    root.append(_sbGroup("personal", "Personal", personal.length, personal.map(_dmItem)));
+  } else {
+    // All: channels + every DM + every person.
+    root.append(_sbGroup("ch", "Channels", channels.length, channels.map(_channelItem)));
+    const onlinePeopleNoDm = onlinePeople.filter((x) =>
+      !dmGroupedOnline.some((c) => dmPeer(c)?.username?.toLowerCase() === x.user.username.toLowerCase()));
+    const offlinePeopleNoDm = offlinePeople.filter((x) =>
+      !dmGroupedOffline.some((c) => dmPeer(c)?.username?.toLowerCase() === x.user.username.toLowerCase()));
+    const onlineItems  = [...dmGroupedOnline.map(_dmItem),  ...onlinePeopleNoDm.map((x) => _personItem(x.user, true))];
+    const offlineItems = [...dmGroupedOffline.map(_dmItem), ...offlinePeopleNoDm.map((x) => _personItem(x.user, false))];
+    root.append(_sbGroup("online",  "Online",  onlineItems.length,  onlineItems));
+    root.append(_sbGroup("offline", "Offline", offlineItems.length, offlineItems));
   }
 
-  if (!items.length) {
-    list.append(el("li", { class: "chat-empty muted xs" },
-      tab === "dms" ? "No direct messages yet."
-      : tab === "channels" ? "No channels yet."
-      : "Nothing here yet."));
+  if (!root.children.length) {
+    root.append(el("div", { class: "chat-empty muted xs" }, "Nothing here yet."));
   }
 }
 
@@ -562,9 +737,17 @@ function setSidebarTab(tab) {
   renderChannels();
 }
 
+function setSidebarFilter(v) {
+  S.sidebarFilter = v || "";
+  const input = $("sbSearch");
+  if (input && input.value !== S.sidebarFilter) input.value = S.sidebarFilter;
+  const clear = $("sbSearchClear");
+  if (clear) clear.hidden = !S.sidebarFilter;
+  renderChannels();
+}
+
 function renderMembers() {
-  // Members are now surfaced through DM creation, not as a separate sidebar
-  // section. This stub keeps existing call sites working.
+  // People are now folded into renderChannels' Online/Offline groups.
 }
 
 async function renderStream() {
@@ -867,12 +1050,13 @@ function updateHeader() {
   const title = $("chTitle"), sub = $("chSub"), badge = $("e2eeBadge"), composer = $("msgInput");
   const avSlot = $("chAvatar");
   const callBtn = $("callBtn");
+  const videoCallBtn = $("videoCallBtn");
   if (!ch) return;
 
   if (ch.kind === "dm") {
     const p = dmPeer(ch);
     title.textContent = p ? p.username : "unknown";
-    sub.textContent = "end-to-end encrypted";
+    sub.textContent = p ? (p.offline ? "offline" : "online") : "";
     badge.classList.remove("hidden");
     composer.placeholder = p ? `Encrypted message to ${p.username}\u2026` : "Message\u2026";
     if (avSlot) {
@@ -881,6 +1065,7 @@ function updateHeader() {
       avSlot.classList.remove("hidden");
     }
     if (callBtn) callBtn.classList.toggle("hidden", !p);
+    if (videoCallBtn) videoCallBtn.classList.toggle("hidden", !p);
   } else {
     title.textContent = "#" + (ch.name || ch.id);
     sub.textContent = ch.kind === "lobby" ? "lobby \u00b7 everyone" : (ch.isPrivate ? "private channel" : "channel");
@@ -892,6 +1077,7 @@ function updateHeader() {
       avSlot.classList.remove("hidden");
     }
     if (callBtn) callBtn.classList.add("hidden");
+    if (videoCallBtn) videoCallBtn.classList.add("hidden");
   }
 }
 
@@ -948,8 +1134,8 @@ function dmPeer(ch) {
       // Peer is offline — return a synthetic record so UI shows the name.
       return {
         id: otherId ?? -1,
-        username: peerName,
-        color: "var(--muted)",
+        username: peerName,                    // original casing
+        color: colorForName(peerName),         // stable color matching server
         avatar: peerName[0]?.toUpperCase() || "?",
         pubkey: null,
         offline: true,
@@ -1067,6 +1253,28 @@ function openCreateChannel() {
   $("newChName").focus();
 }
 function closeModal(id) { $(id).classList.add("hidden"); }
+
+// ── Confirm dialog (returns Promise<boolean>) ────────────────────────
+let _cfResolve = null;
+function confirmDialog({ title = "Confirm", body = "", okText = "Delete", okClass = "btn-danger", cancelText = "Cancel" } = {}) {
+  return new Promise((resolve) => {
+    _cfResolve = resolve;
+    $("cfTitle").textContent = title;
+    $("cfBody").textContent = body;
+    const ok = $("cfOk");
+    ok.textContent = okText;
+    ok.className = "btn " + okClass;
+    $("cfCancel").textContent = cancelText;
+    $("confirmModal").classList.remove("hidden");
+    setTimeout(() => ok.focus(), 0);
+  });
+}
+function closeConfirm(result) {
+  $("confirmModal").classList.add("hidden");
+  const r = _cfResolve; _cfResolve = null;
+  if (r) r(!!result);
+}
+Object.assign(window, { closeConfirm });
 function createChannel(e) {
   e.preventDefault();
   const name = $("newChName").value.trim();
@@ -1312,12 +1520,13 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closeLightbox();
     closeEmoji();
+    if (_cfResolve) closeConfirm(false);
     for (const m of document.querySelectorAll(".modal:not(.hidden)")) m.classList.add("hidden");
   }
 });
 
 // expose for inline onclick handlers
-Object.assign(window, { openCreateChannel, openDmPicker, closeModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker });
+Object.assign(window, { openCreateChannel, openDmPicker, closeModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker, toggleCamera });
 
 // ── Theme ────────────────────────────────────────────────────────────
 function toggleTheme() {
@@ -1354,6 +1563,8 @@ const Call = {
   peerName: "",
   state: "idle",      // idle | calling | ringing | active
   muted: false,
+  isVideo: false,     // true if this call has video
+  camOn: false,       // local video track currently sending
   pendingIce: [],     // ICE arrived before remoteDescription was set
 };
 
@@ -1366,29 +1577,32 @@ function callSend(kind, payload) {
   sendOp({ op: "call_signal", channel: Call.channelId, kind, payload: payload ?? null });
 }
 
-async function startCall() {
+async function startCall(video) {
   if (Call.state !== "idle") return;
   const ch = S.channels.get(S.active);
   if (!ch || ch.kind !== "dm") return;
   const peer = dmPeer(ch);
   if (!peer) return;
+  const wantVideo = !!video;
   try {
-    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: wantVideo });
   } catch (e) {
-    toast("Mic permission denied: " + e.message);
+    toast((wantVideo ? "Camera/mic" : "Mic") + " permission denied: " + e.message);
     return;
   }
   Call.channelId = ch.id;
   Call.peerId = peer.id;
   Call.peerName = peer.username;
   Call.state = "calling";
-  showCallBar("Calling…");
+  Call.isVideo = wantVideo;
+  Call.camOn = wantVideo;
+  showCallBar(wantVideo ? "Video calling…" : "Calling…");
   await createPC();
-  // Add local audio tracks before creating offer.
-  for (const t of Call.localStream.getAudioTracks()) Call.pc.addTrack(t, Call.localStream);
-  const offer = await Call.pc.createOffer({ offerToReceiveAudio: true });
+  for (const t of Call.localStream.getTracks()) Call.pc.addTrack(t, Call.localStream);
+  if (wantVideo) attachLocalVideo();
+  const offer = await Call.pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: wantVideo });
   await Call.pc.setLocalDescription(offer);
-  callSend("offer", { sdp: Call.pc.localDescription });
+  callSend("offer", { sdp: Call.pc.localDescription, video: wantVideo });
 }
 
 async function createPC() {
@@ -1398,16 +1612,30 @@ async function createPC() {
     if (ev.candidate) callSend("ice", { candidate: ev.candidate });
   };
   pc.ontrack = (ev) => {
+    const stream = ev.streams && ev.streams[0];
+    if (!stream) return;
     const audio = $("remoteAudio");
-    if (audio && ev.streams && ev.streams[0]) {
-      audio.srcObject = ev.streams[0];
+    if (audio) audio.srcObject = stream;
+    if (ev.track.kind === "video") {
+      const v = $("remoteVideo");
+      if (v) v.srcObject = stream;
+      // Only reveal the video stage once the call is actually active
+      // (not during the ringing phase — the incoming-call modal owns the UI then).
+      if (Call.state === "active") showVideoStage(true);
     }
   };
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     if (s === "connected") {
       Call.state = "active";
-      setCallStatus("Connected");
+      setCallStatus(Call.isVideo ? "Connected (video)" : "Connected");
+      if (Call.isVideo) {
+        const rv = $("remoteVideo");
+        // Re-attach in case the remote stream was set before "active".
+        const audio = $("remoteAudio");
+        if (rv && audio && audio.srcObject) rv.srcObject = audio.srcObject;
+        showVideoStage(true);
+      }
     } else if (s === "failed" || s === "disconnected" || s === "closed") {
       if (Call.state !== "idle") teardownCall(false);
     }
@@ -1418,15 +1646,18 @@ async function acceptCall() {
   if (Call.state !== "ringing") return;
   stopRingtone();
   $("incomingCall").classList.add("hidden");
+  const wantVideo = !!Call.isVideo;
   try {
-    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: wantVideo });
   } catch (e) {
-    toast("Mic permission denied: " + e.message);
+    toast((wantVideo ? "Camera/mic" : "Mic") + " permission denied: " + e.message);
     callSend("decline", null);
     resetCallState();
     return;
   }
-  for (const t of Call.localStream.getAudioTracks()) Call.pc.addTrack(t, Call.localStream);
+  Call.camOn = wantVideo;
+  for (const t of Call.localStream.getTracks()) Call.pc.addTrack(t, Call.localStream);
+  if (wantVideo) attachLocalVideo();
   const answer = await Call.pc.createAnswer();
   await Call.pc.setLocalDescription(answer);
   callSend("answer", { sdp: Call.pc.localDescription });
@@ -1460,7 +1691,7 @@ function toggleMute() {
 async function toggleSpeaker() {
   const audio = $("remoteAudio");
   if (!audio) return;
-  Call._speakerState = !(Call._speakerState ?? true);
+  Call._speakerState = !(Call._speakerState ?? false);
   const speakerOn = Call._speakerState;
   // Best-effort: pick a different audio output device when available.
   try {
@@ -1481,6 +1712,52 @@ async function toggleSpeaker() {
   toast(speakerOn ? "Speaker on" : "Speaker off");
 }
 
+async function toggleCamera() {
+  if (!Call.localStream || !Call.isVideo) return;
+  // If we already have a video track, just enable/disable it.
+  let vt = Call.localStream.getVideoTracks()[0];
+  if (vt) {
+    vt.enabled = !vt.enabled;
+    Call.camOn = vt.enabled;
+  } else {
+    // Add a video track on demand (mid-call upgrade).
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: true });
+      vt = s.getVideoTracks()[0];
+      Call.localStream.addTrack(vt);
+      // Replace into the existing PC if a video sender exists, else add.
+      const sender = Call.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      if (sender) await sender.replaceTrack(vt);
+      else Call.pc.addTrack(vt, Call.localStream);
+      Call.camOn = true;
+    } catch (e) {
+      toast("Camera permission denied: " + e.message);
+      return;
+    }
+  }
+  attachLocalVideo();
+  const btn = $("camBtn");
+  if (btn) btn.classList.toggle("active", !Call.camOn);
+}
+
+function attachLocalVideo() {
+  const v = $("localVideo");
+  if (v && Call.localStream) v.srcObject = Call.localStream;
+  showVideoStage(true);
+  const btn = $("camBtn");
+  if (btn) {
+    btn.classList.remove("hidden");
+    btn.classList.toggle("active", !Call.camOn);
+  }
+}
+
+function showVideoStage(on) {
+  const stage = $("videoStage");
+  if (!stage) return;
+  stage.classList.toggle("hidden", !on);
+  stage.setAttribute("aria-hidden", on ? "false" : "true");
+}
+
 function teardownCall(local) {
   stopRingtone();
   try { Call.pc?.close(); } catch {}
@@ -1489,6 +1766,9 @@ function teardownCall(local) {
   }
   const audio = $("remoteAudio");
   if (audio) audio.srcObject = null;
+  const rv = $("remoteVideo"); if (rv) rv.srcObject = null;
+  const lv = $("localVideo");  if (lv) lv.srcObject = null;
+  showVideoStage(false);
   $("callPanel").classList.add("hidden");
   $("incomingCall").classList.add("hidden");
   if (local !== true) toast("Call ended");
@@ -1503,14 +1783,18 @@ function resetCallState() {
   Call.peerName = "";
   Call.state = "idle";
   Call.muted = false;
-  Call._speakerState = true;
+  Call.isVideo = false;
+  Call.camOn = false;
+  Call._speakerState = false;
   Call.pendingIce = [];
   const btn = $("muteBtn");
   if (btn) btn.classList.remove("active");
   const sbtn = $("speakerBtn");
-  if (sbtn) sbtn.classList.add("active");
+  if (sbtn) sbtn.classList.remove("active");
+  const cbtn = $("camBtn");
+  if (cbtn) { cbtn.classList.remove("active"); cbtn.classList.add("hidden"); }
   const audio = $("remoteAudio");
-  if (audio) audio.volume = 1.0;
+  if (audio) audio.volume = 0.35;
 }
 
 function showCallBar(status) {
@@ -1545,6 +1829,7 @@ async function onCallSignal({ channel, kind, from, fromName, payload }) {
     Call.peerId = from;
     Call.peerName = fromName || (S.users.get(from)?.username || "unknown");
     Call.state = "ringing";
+    Call.isVideo = !!payload?.video;
     await createPC();
     try {
       await Call.pc.setRemoteDescription(payload.sdp);
@@ -1562,6 +1847,10 @@ async function onCallSignal({ channel, kind, from, fromName, payload }) {
       av.style.background = peer?.color || "var(--brand)";
     }
     $("icName").textContent = Call.peerName;
+    const icSub = $("icSub");
+    if (icSub) icSub.textContent = Call.isVideo ? "is video calling…" : "is calling…";
+    const icTitle = $("icTitle");
+    if (icTitle) icTitle.textContent = Call.isVideo ? "Incoming video call" : "Incoming audio call";
     $("incomingCall").classList.remove("hidden");
     startRingtone();
     return;

@@ -532,7 +532,8 @@ input:focus, textarea:focus {
   max-width: 78%;
 }
 /* Own messages: pin the stack to the right edge of the row */
-.msg.own .msg-stack { margin-left: auto; }
+.msg.own .msg-stack { margin-left: auto; align-items: flex-end; }
+.msg.own .msg-stack .bubble { align-self: flex-end; }
 
 /* Header row above bubble: Author • Time (incoming) or Time (own/DM) */
 .msg-header {
@@ -599,14 +600,16 @@ input:focus, textarea:focus {
 .msg.own .bubble:has(.image-att) > .text { padding-right: 32px; }
 .bubble:has(.image-att) > .meta { right: 10px; bottom: 8px; }
 
-/* No caption: ticks (own) overlay the image with a soft gradient backdrop */
+/* No caption: ticks (own) overlay the image as a compact pill at bottom-right */
 .bubble:has(.image-att):not(:has(> .text)) > .meta {
   position: absolute;
-  right: 10px;
-  bottom: 10px;
-  padding: 2px 8px;
+  right: 8px;
+  bottom: 8px;
+  left: auto;
+  width: auto;
+  padding: 2px 6px;
   border-radius: 8px;
-  background: rgba(0,0,0,0.45);
+  background: rgba(0,0,0,0.55);
   color: #fff !important;
   text-shadow: 0 1px 1px rgba(0,0,0,0.4);
 }
@@ -746,7 +749,7 @@ input:focus, textarea:focus {
   border-radius: 7px;
   overflow: hidden;
   cursor: zoom-in;
-  background: rgba(0, 0, 0, 0.2);
+  background: transparent;
 }
 .bubble .image-att img {
   display: block;
@@ -756,17 +759,8 @@ input:focus, textarea:focus {
   object-fit: cover;
 }
 .bubble .image-att .img-meta {
-  position: absolute; left: 0; right: 0; bottom: 0;
-  padding: 18px 10px 6px;
-  font-size: 11px; color: rgba(255, 255, 255, 0.94);
-  background: linear-gradient(transparent, rgba(0, 0, 0, 0.65));
-  display: flex; justify-content: space-between; gap: 8px;
-  opacity: 0; transition: opacity var(--transition);
-  pointer-events: none;
+  display: none;
 }
-.bubble .image-att:hover .img-meta { opacity: 1; }
-.bubble .image-att .img-meta a { color: white; text-decoration: none; pointer-events: auto; }
-.bubble .image-att .img-meta a:hover { text-decoration: underline; }
 
 /* ─── Lightbox ──────────────────────────────────────────────── */
 .lightbox {
@@ -1286,3 +1280,246 @@ input:focus, textarea:focus {
 .call-bar-actions { display:flex; align-items:center; gap:6px; }
 .call-bar .icon-btn.active { background:#e23b3b; color:#fff; }
 @media (max-width: 780px) { .call-bar { left:8px; right:8px; min-width:0; } }
+
+/* ── Video call stage ─────────────────────────────────────── */
+.video-stage{position:fixed;left:0;right:0;top:0;bottom:64px;background:#000;z-index:90;display:flex;align-items:center;justify-content:center}
+.video-stage.hidden{display:none}
+.video-stage #remoteVideo{width:100%;height:100%;object-fit:contain;background:#000}
+.video-stage #localVideo{position:absolute;right:14px;top:14px;width:160px;max-width:30vw;aspect-ratio:4/3;object-fit:cover;border-radius:10px;border:2px solid rgba(255,255,255,.4);background:#222;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+@media (max-width:780px){
+  .video-stage{bottom:74px}
+  .video-stage #localVideo{width:110px;right:10px;top:10px}
+}
+#incomingCall.modal{z-index:200}
+
+/* People-online section in sidebar */
+.sb-section-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 6px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.people-list .avatar{position:relative}
+.avatar-online .presence-dot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;background:var(--ok);border:2px solid var(--bg, #0e0f12);box-shadow:0 0 0 1px rgba(34,197,94,.3)}
+
+/* Compact lock badge in 1:1 header */
+.badge-lock{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;color:var(--ok);background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.35)}
+.badge-lock.hidden{display:none}
+
+/* (header buttons keep default .icon-btn sizing on all viewports) */
+
+/* ─────────────────────────────────────────────────────────────
+   In-call control dock — large, modern, touch-friendly
+   ───────────────────────────────────────────────────────────── */
+.call-bar{
+  position:fixed; left:50%; bottom:18px; right:auto; transform:translateX(-50%);
+  z-index:200;
+  display:flex; align-items:center; gap:16px;
+  padding:12px 16px;
+  background:rgba(20,22,28,.85);
+  backdrop-filter:blur(20px) saturate(1.4);
+  -webkit-backdrop-filter:blur(20px) saturate(1.4);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:999px;
+  box-shadow:0 12px 40px rgba(0,0,0,.45), 0 2px 6px rgba(0,0,0,.25);
+  color:#fff;
+  min-width:0;
+}
+.call-bar .call-bar-info{ flex:0 1 auto; padding-right:6px; }
+.call-bar .call-bar-info .call-name{ color:#fff; font-weight:600; }
+.call-bar .call-bar-info .muted{ color:rgba(255,255,255,.65) !important; }
+.call-bar .call-avatar.small{ width:38px; height:38px; font-size:15px; }
+
+.call-bar-actions{
+  display:flex; align-items:center; gap:12px;
+  padding-left:10px;
+  border-left:1px solid rgba(255,255,255,.10);
+}
+
+/* Round control buttons — sized to match the avatar (38px) */
+.call-bar .icon-btn{
+  width:38px; height:38px; padding:0;
+  border-radius:50%;
+  display:inline-flex; align-items:center; justify-content:center;
+  background:rgba(255,255,255,.12); color:#fff;
+  border:1px solid rgba(255,255,255,.10);
+  transition:transform .08s ease, background .15s ease;
+}
+.call-bar .icon-btn:hover{ background:rgba(255,255,255,.20); }
+.call-bar .icon-btn:active{ transform:scale(.92); }
+.call-bar .icon-btn svg{ width:18px; height:18px; }
+
+/* Mute / Camera-off "active" = on-state highlight (red) */
+.call-bar #muteBtn.active,
+.call-bar #camBtn.active{
+  background:#ef4444; color:#fff; border-color:rgba(239,68,68,.5);
+  box-shadow:0 0 0 4px rgba(239,68,68,.18);
+}
+/* Speaker on = subtle green tint */
+.call-bar #speakerBtn.active{
+  background:rgba(34,197,94,.22); color:#bbf7d0; border-color:rgba(34,197,94,.35);
+}
+
+/* End-call: compact red pill at avatar height */
+.call-bar .btn-danger{
+  height:38px; padding:0 14px;
+  border-radius:19px;
+  background:#ef4444; color:#fff; border:0;
+  font-weight:600; font-size:13px;
+  box-shadow:0 3px 10px rgba(239,68,68,.4);
+}
+.call-bar .btn-danger:hover{ background:#dc2626; }
+.call-bar .btn-danger:active{ transform:scale(.94); }
+
+/* Mobile: stretch full-width but keep avatar-sized buttons */
+@media (max-width:780px){
+  .call-bar{
+    left:10px; right:10px; transform:none; bottom:12px;
+    border-radius:22px;
+    padding:8px 10px;
+    gap:8px;
+    justify-content:space-between;
+  }
+  .call-bar .call-bar-info{ flex:1 1 auto; min-width:0; padding-right:4px; }
+  .call-bar .call-bar-info .call-name{ font-size:14px; }
+  .call-bar-actions{ gap:8px; padding-left:8px; }
+}
+
+/* On a video call, dock floats over the video — give it a stronger shadow */
+.video-stage:not(.hidden) ~ .call-bar{
+  background:rgba(0,0,0,.55);
+  border-color:rgba(255,255,255,.18);
+}
+@media (max-width:780px){ .video-stage{ bottom:70px; } }
+
+/* Offline presence dot — Teams style: keep avatar color, grey ring */
+.avatar-offline .presence-dot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;background:#9ca3af;border:2px solid var(--bg, #0e0f12);box-shadow:0 0 0 1px rgba(156,163,175,.3)}
+.avatar-offline{ filter:none; }  /* keep original color */
+.chat-item:has(.avatar-offline){ opacity:.78; }
+
+/* Sidebar collapsible groups */
+.sb-groups{ display:flex; flex-direction:column; gap:2px; }
+.sb-group{ border:0; }
+.sb-group > summary{
+  list-style:none; cursor:pointer;
+  display:flex; align-items:center; gap:8px;
+  padding:10px 16px 6px;
+  text-transform:uppercase; letter-spacing:.5px; font-size:11px; font-weight:700;
+  color:var(--muted, #888); user-select:none;
+}
+.sb-group > summary::-webkit-details-marker{ display:none; }
+.sb-group .sb-caret{ display:inline-flex; transition:transform .15s ease; opacity:.7; }
+.sb-group[open] .sb-caret{ transform:rotate(90deg); }
+.sb-group .sb-group-title{ flex:1; }
+.sb-group .sb-group-count{ font-weight:600; }
+.sb-group > summary:hover{ color:var(--fg-0, #fff); background:var(--bg-hover, transparent); }
+.sb-group .chat-list{ padding:0; margin:0; }
+
+/* Sidebar search */
+.sb-search{
+  position:relative;
+  margin:8px 12px 6px;
+  display:flex; align-items:center;
+}
+.sb-search-icon{
+  position:absolute; left:10px; top:50%;
+  transform:translateY(-50%);
+  color:var(--muted, #888); pointer-events:none;
+}
+.sb-search input{
+  width:100%;
+  padding:7px 28px 7px 30px;
+  border-radius:8px;
+  border:1px solid var(--border, rgba(255,255,255,.08));
+  background:var(--bg-1, rgba(255,255,255,.04));
+  color:var(--fg-0, inherit);
+  font-size:13px;
+  outline:none;
+  transition:border-color .15s, background .15s;
+}
+.sb-search input::placeholder{ color:var(--muted, #888); }
+.sb-search input:focus{
+  border-color:var(--brand, #6366f1);
+  background:var(--bg-0, rgba(255,255,255,.06));
+}
+.sb-search input::-webkit-search-cancel-button{ -webkit-appearance:none; }
+.sb-search-clear{
+  position:absolute; right:6px; top:50%;
+  transform:translateY(-50%);
+  width:20px; height:20px; padding:0;
+  border:0; background:transparent;
+  color:var(--muted, #888);
+  font-size:18px; line-height:1; cursor:pointer;
+  border-radius:50%;
+}
+.sb-search-clear:hover{ color:var(--fg-0, #fff); background:rgba(255,255,255,.08); }
+
+/* Delete button on DM chat rows */
+.chat-item .chat-del{
+  display:none;
+  width:26px; height:26px; padding:0;
+  margin-left:4px; border:0; background:transparent;
+  color:var(--muted, #888); border-radius:6px; cursor:pointer;
+  align-items:center; justify-content:center;
+}
+.chat-item:hover .chat-del{ display:inline-flex; }
+.chat-item .chat-del:hover{ color:#ef4444; background:rgba(239,68,68,.12); }
+@media (max-width:780px){
+  .chat-item .chat-del{ display:inline-flex; }
+}
+
+/* ── Stable call-bar layout (no flicker on status changes) ── */
+.call-bar .call-bar-info{
+  width: 220px; flex: 0 0 220px; min-width: 0;
+  display:flex; align-items:center; gap:10px;
+}
+.call-bar .call-bar-info > div{ min-width:0; flex:1 1 auto; }
+.call-bar .call-bar-info .call-name,
+.call-bar .call-bar-info .muted{
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display:block;
+}
+@media (max-width: 780px){
+  .call-bar .call-bar-info{ width:auto; flex:1 1 auto; }
+}
+
+/* ── Call control button colors ─────────────────────────────── */
+/* Mic / Camera: NEUTRAL grey when ON (default state — like normal icon button) */
+.call-bar #muteBtn,
+.call-bar #camBtn{
+  background: rgba(255,255,255,.12);
+  color: #fff;
+  border-color: rgba(255,255,255,.10);
+}
+.call-bar #muteBtn:hover,
+.call-bar #camBtn:hover{ background: rgba(255,255,255,.20); }
+
+/* Mic / Camera: RED when DISABLED (.active class set by toggleMute/toggleCamera) */
+.call-bar #muteBtn.active,
+.call-bar #camBtn.active{
+  background: #ef4444; color: #fff; border-color: rgba(239,68,68,.5);
+  box-shadow: 0 0 0 4px rgba(239,68,68,.18);
+}
+
+/* Speaker: grey by default, GREEN when speaker on (.active) */
+.call-bar #speakerBtn{
+  background: rgba(255,255,255,.12);
+  color: #fff;
+  border-color: rgba(255,255,255,.10);
+}
+.call-bar #speakerBtn:hover{ background: rgba(255,255,255,.20); }
+.call-bar #speakerBtn.active{
+  background: rgba(34,197,94,.22); color: #bbf7d0; border-color: rgba(34,197,94,.45);
+}
+
+/* Avatar: ensure perfect circle inside flex row (don't let it shrink) */
+.call-bar .call-avatar,
+.call-bar .call-avatar.small{
+  flex: 0 0 auto;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+}
+
+/* End call: solid red round button (no text) */
+.call-bar .end-btn{
+  background: #ef4444 !important;
+  color: #fff !important;
+  border: 0 !important;
+  box-shadow: 0 4px 14px rgba(239,68,68,.45);
+}
+.call-bar .end-btn:hover{ background: #dc2626 !important; }

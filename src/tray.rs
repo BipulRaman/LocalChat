@@ -55,9 +55,9 @@ pub fn run_event_loop(state: Arc<AppState>, port: u16) {
     let lan_ips = crate::net::lan_addresses();
     let lan_url = lan_ips
         .first()
-        .map(|ip| format!("http://{ip}:{port}"))
-        .unwrap_or_else(|| format!("http://localhost:{port}"));
-    let local_url = format!("http://localhost:{port}");
+        .map(|ip| format!("https://{ip}:{port}"))
+        .unwrap_or_else(|| format!("https://localhost:{port}"));
+    let local_url = format!("https://localhost:{port}");
 
     let menu_channel = MenuEvent::receiver();
 

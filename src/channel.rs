@@ -193,8 +193,9 @@ impl ChannelRegistry {
             self.add_user_channel(b_id, &c.id);
             return c;
         }
-        let mut names = [a_name.to_lowercase().to_compact_string(), b_name.to_lowercase().to_compact_string()];
-        names.sort();
+        // Keep ORIGINAL casing for display; sort by lowercase for stability.
+        let mut names = [a_name.to_compact_string(), b_name.to_compact_string()];
+        if names[0].to_lowercase() > names[1].to_lowercase() { names.swap(0, 1); }
         let mut ch = Channel::new(
             id.clone(),
             ChannelKind::Dm,
@@ -221,7 +222,7 @@ impl ChannelRegistry {
         for entry in self.map.iter() {
             let ch = entry.value();
             if let Some(names) = &ch.dm_users {
-                if names.iter().any(|n| n.as_str() == lname) {
+                if names.iter().any(|n| n.to_lowercase() == lname) {
                     ch.members.insert(user_id);
                     self.add_user_channel(user_id, &ch.id);
                     out.push(ch.id.clone());
@@ -242,6 +243,20 @@ impl ChannelRegistry {
         if let Some(mut v) = self.user_channels.get_mut(&user) {
             v.retain(|c| c != id);
         }
+    }
+
+    /// Permanently delete a DM channel and detach it from every member.
+    /// Returns the list of UserIds that had this channel attached so callers
+    /// can notify their live sessions. No-op for non-DM channels.
+    pub fn delete_dm(&self, id: &str) -> Vec<UserId> {
+        let Some(ch) = self.get(id) else { return Vec::new(); };
+        if !matches!(ch.kind, ChannelKind::Dm) { return Vec::new(); }
+        let members: Vec<UserId> = ch.members.iter().map(|e| *e).collect();
+        for uid in &members {
+            self.remove_user_channel(*uid, id);
+        }
+        self.map.remove(id);
+        members
     }
 
     /// Return channels visible to `user`: public groups + their own.

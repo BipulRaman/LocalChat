@@ -640,6 +640,44 @@ async fn handle_op(
             }
         }
 
+        "dm_delete" => {
+            let id = v.get("channel").and_then(Value::as_str).ok_or("missing channel")?;
+            let ch = state.channels.get(id).ok_or("no such channel")?;
+            if !matches!(ch.kind, ChannelKind::Dm) {
+                return Err("only DMs can be deleted".into());
+            }
+            if !ch.members.contains(&user_id) {
+                return Err("not a member".into());
+            }
+            let id_str: CompactString = ch.id.clone();
+            // Tell ALL members (including peer's other tabs and ourselves) to drop it
+            // BEFORE we tear it down, while the broadcaster still exists.
+            let _ = ch.tx.send(Arc::new(WireMsg {
+                id: 0,
+                channel: id_str.clone(),
+                kind: MsgKind::System,
+                user_id,
+                username: CompactString::const_new("__dm_deleted"),
+                avatar: CompactString::const_new(""),
+                color: CompactString::const_new(""),
+                ts: now_secs(),
+                text: json!({"channel": id_str}).to_string(),
+                file: None,
+                reply_to: None,
+                edited_at: None,
+                deleted: true,
+            }));
+            // Detach all members and drop the channel.
+            state.channels.delete_dm(&id_str);
+            // Wipe persisted history.
+            state.history.delete_channel(&id_str).await;
+            // Drop our own subscription so the local rxs loop stops polling it.
+            own_channels.retain(|c| c != &id_str);
+            let _ = sink
+                .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
+                .await;
+        }
+
         "history" => {
             let id = v
                 .get("channel")
