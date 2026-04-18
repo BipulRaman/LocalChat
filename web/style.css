@@ -1270,3 +1270,19 @@ input:focus, textarea:focus {
     max-height: 50dvh;
   }
 }
+
+/* Audio call UI */
+.call-panel { min-width: 280px; max-width: 340px; }
+.call-body { display:flex; flex-direction:column; align-items:center; gap:8px; padding:24px 16px; }
+.call-avatar { width:72px; height:72px; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; font-size:28px; background:var(--brand); }
+.call-avatar.small { width:36px; height:36px; font-size:15px; }
+.call-name { font-weight:600; font-size:16px; }
+.call-name.sm { font-size:14px; }
+.call-foot { display:flex; justify-content:space-between; gap:12px; padding:12px 16px; }
+.btn-danger { background:#e23b3b; color:#fff; border:0; padding:8px 18px; border-radius:8px; font-weight:600; cursor:pointer; }
+.btn-danger:hover { background:#c93232; }
+.call-bar { position:fixed; right:16px; bottom:16px; z-index:200; background:var(--surface,#fff); border:1px solid var(--border,#e5e7eb); box-shadow:0 8px 24px rgba(0,0,0,.18); border-radius:12px; padding:10px 12px; display:flex; align-items:center; gap:14px; min-width:280px; }
+.call-bar-info { display:flex; align-items:center; gap:10px; flex:1; min-width:0; }
+.call-bar-actions { display:flex; align-items:center; gap:6px; }
+.call-bar .icon-btn.active { background:#e23b3b; color:#fff; }
+@media (max-width: 780px) { .call-bar { left:8px; right:8px; min-width:0; } }

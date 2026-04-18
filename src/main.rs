@@ -71,7 +71,7 @@ fn main() -> Result<(), BoxErr> {
     if !std::env::args().any(|a| a == "--no-browser")
         && std::env::var("NO_BROWSER").unwrap_or_default() != "1"
     {
-        let _ = opener::open(format!("http://localhost:{port}"));
+        let _ = opener::open(format!("https://localhost:{port}"));
     }
 
     // ---- Either run the tray loop on the main thread, or just park here.

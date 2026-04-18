@@ -34,6 +34,8 @@ pub struct ChannelMeta {
     pub created_by: UserId,
     #[serde(rename = "createdAt")]
     pub created_at: u64,
+    #[serde(rename = "dmUsers", skip_serializing_if = "Option::is_none")]
+    pub dm_users: Option<[CompactString; 2]>,
 }
 
 pub struct Channel {
@@ -47,6 +49,10 @@ pub struct Channel {
     pub tx: broadcast::Sender<Arc<WireMsg>>,
     pub history: RwLock<VecDeque<Arc<WireMsg>>>,
     pub history_cap: usize,
+    /// For DM channels: the two participant usernames (lowercased, sorted).
+    /// Used to re-bind a returning user's new ephemeral UserId on reconnect
+    /// so DMs persist across page reloads.
+    pub dm_users: Option<[CompactString; 2]>,
 }
 
 impl Channel {
@@ -70,6 +76,7 @@ impl Channel {
             tx,
             history: RwLock::new(VecDeque::with_capacity(history_cap)),
             history_cap,
+            dm_users: None,
         }
     }
 
@@ -82,6 +89,7 @@ impl Channel {
             members: self.members.iter().map(|e| *e).collect(),
             created_by: self.created_by,
             created_at: self.created_at,
+            dm_users: self.dm_users.clone(),
         }
     }
 
@@ -155,32 +163,72 @@ impl ChannelRegistry {
         ch
     }
 
-    /// DM channels have a deterministic ID from the sorted user IDs,
-    /// so `dm_open(a, b)` is idempotent no matter who initiates.
-    pub fn dm_id(a: UserId, b: UserId) -> ChannelId {
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        format!("dm:{lo}:{hi}").to_compact_string()
+    /// DM channels are keyed by a stable hash of the two participant
+    /// usernames (lowercased, sorted) — NOT by ephemeral UserIds — so the
+    /// channel survives reconnects where the user gets a new UserId.
+    pub fn dm_id_for_names(a: &str, b: &str) -> ChannelId {
+        let mut x = a.to_lowercase();
+        let mut y = b.to_lowercase();
+        if x > y { std::mem::swap(&mut x, &mut y); }
+        // FNV-1a 64 over "a|b".
+        let mut h: u64 = 0xcbf29ce484222325;
+        for byte in x.bytes().chain(b"|".iter().copied()).chain(y.bytes()) {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("dm:{:016x}", h).to_compact_string()
     }
 
-    pub fn open_dm(&self, a: UserId, b: UserId) -> Arc<Channel> {
-        let id = Self::dm_id(a, b);
+    pub fn open_dm(
+        &self,
+        a_id: UserId, a_name: &str,
+        b_id: UserId, b_name: &str,
+    ) -> Arc<Channel> {
+        let id = Self::dm_id_for_names(a_name, b_name);
         if let Some(c) = self.get(&id) {
+            // Refresh members in case either side is reconnecting.
+            c.members.insert(a_id);
+            c.members.insert(b_id);
+            self.add_user_channel(a_id, &c.id);
+            self.add_user_channel(b_id, &c.id);
             return c;
         }
-        let ch = Arc::new(Channel::new(
+        let mut names = [a_name.to_lowercase().to_compact_string(), b_name.to_lowercase().to_compact_string()];
+        names.sort();
+        let mut ch = Channel::new(
             id.clone(),
             ChannelKind::Dm,
             CompactString::const_new(""),
             true,
-            a,
+            a_id,
             self.history_cap,
-        ));
-        ch.members.insert(a);
-        ch.members.insert(b);
+        );
+        ch.dm_users = Some(names);
+        let ch = Arc::new(ch);
+        ch.members.insert(a_id);
+        ch.members.insert(b_id);
         self.map.insert(id.clone(), Arc::clone(&ch));
-        self.add_user_channel(a, &id);
-        self.add_user_channel(b, &id);
+        self.add_user_channel(a_id, &id);
+        self.add_user_channel(b_id, &id);
         ch
+    }
+
+    /// Re-bind any DM channels that contain `username` to the new `user_id`.
+    /// Returns the channel IDs that were rebound.
+    pub fn rebind_user_dms(&self, user_id: UserId, username: &str) -> Vec<ChannelId> {
+        let lname = username.to_lowercase();
+        let mut out = Vec::new();
+        for entry in self.map.iter() {
+            let ch = entry.value();
+            if let Some(names) = &ch.dm_users {
+                if names.iter().any(|n| n.as_str() == lname) {
+                    ch.members.insert(user_id);
+                    self.add_user_channel(user_id, &ch.id);
+                    out.push(ch.id.clone());
+                }
+            }
+        }
+        out
     }
 
     pub fn add_user_channel(&self, user: UserId, id: &ChannelId) {

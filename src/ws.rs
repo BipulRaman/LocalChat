@@ -119,10 +119,19 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     lobby.members.insert(user_id);
     state.channels.add_user_channel(user_id, &lobby.id);
 
+    // Re-bind any DM channels that contain this username so they survive
+    // page reloads (DMs are keyed by username hash, members are ephemeral).
+    let rebound_dms = state.channels.rebind_user_dms(user_id, &info.username);
+
     // Subscribe to all channels this user can see.
     let mut rxs: smallvec::SmallVec<[broadcast::Receiver<Arc<WireMsg>>; 8]> =
         smallvec::smallvec![];
     rxs.push(lobby.tx.subscribe());
+    for cid in &rebound_dms {
+        if let Some(ch) = state.channels.get(cid) {
+            rxs.push(ch.tx.subscribe());
+        }
+    }
 
     // Welcome envelope.
     let welcome = json!({
@@ -147,6 +156,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     // ---- Main loop: multiplex incoming ops and outgoing broadcasts.
     let mut own_channels: smallvec::SmallVec<[CompactString; 8]> =
         smallvec::smallvec![lobby.id.clone()];
+    for cid in rebound_dms { own_channels.push(cid); }
 
     loop {
         tokio::select! {
@@ -170,6 +180,30 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
             out = recv_any(&mut rxs) => {
                 match out {
                     Some(msg) => {
+                        // Intercept the __dm_subscribe control event: if it's
+                        // addressed to us, subscribe to the named channel and
+                        // do NOT forward it to the client.
+                        if msg.username == "__dm_subscribe" {
+                            if let Ok(v) = serde_json::from_str::<Value>(&msg.text) {
+                                let target = v.get("forUserId").and_then(Value::as_u64).unwrap_or(0) as UserId;
+                                if target == user_id {
+                                    if let Some(ch_id) = v.get("channel").and_then(Value::as_str) {
+                                        let cid = ch_id.to_compact_string();
+                                        if !own_channels.iter().any(|c| c == &cid) {
+                                            if let Some(ch) = state.channels.get(&cid) {
+                                                rxs.push(ch.tx.subscribe());
+                                                own_channels.push(cid.clone());
+                                                // Push a ch_created event so the
+                                                // client can show the DM in its sidebar.
+                                                let out = json!({"ev":"ch_created","channel":ch.meta()});
+                                                let _ = sink.send(Message::Text(out.to_string())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if sink.send(Message::Text(msg_to_json(&msg))).await.is_err() {
                             break;
                         }
@@ -564,7 +598,13 @@ async fn handle_op(
             if peer == user_id {
                 return Err("cannot DM yourself".into());
             }
-            let ch = state.channels.open_dm(user_id, peer);
+            let my_name = state.users.get(&user_id)
+                .map(|e| e.value().username.to_string())
+                .ok_or("self gone")?;
+            let peer_name = state.users.get(&peer)
+                .map(|e| e.value().username.to_string())
+                .ok_or("peer gone")?;
+            let ch = state.channels.open_dm(user_id, &my_name, peer, &peer_name);
             if !own_channels.iter().any(|c| c == &ch.id) {
                 rxs.push(ch.tx.subscribe());
                 own_channels.push(ch.id.clone());
@@ -572,6 +612,32 @@ async fn handle_op(
             let out = json!({"ev":"ch_created","channel":ch.meta()});
             let _ = sink.send(Message::Text(out.to_string())).await;
             send_history(sink, &ch, 50).await;
+
+            // Tell the peer's WS handler (via the lobby bus) to subscribe to
+            // this DM channel as well, so messages reach them in real-time
+            // even if they haven't opened the DM yet.
+            if let Some(lobby) = state.channels.get(LOBBY_ID) {
+                let payload = json!({
+                    "ev": "dm_subscribe",
+                    "channel": ch.id,
+                    "forUserId": peer,
+                });
+                let _ = lobby.tx.send(Arc::new(WireMsg {
+                    id: 0,
+                    channel: lobby.id.clone(),
+                    kind: MsgKind::System,
+                    user_id,
+                    username: CompactString::const_new("__dm_subscribe"),
+                    avatar: CompactString::const_new(""),
+                    color: CompactString::const_new(""),
+                    ts: now_secs(),
+                    text: payload.to_string(),
+                    file: None,
+                    reply_to: None,
+                    edited_at: None,
+                    deleted: false,
+                }));
+            }
         }
 
         "history" => {
@@ -686,6 +752,56 @@ async fn handle_op(
 
         "ping" => {
             let _ = sink.send(Message::Text(r#"{"ev":"pong"}"#.into())).await;
+        }
+
+        "call_signal" => {
+            // Relay a WebRTC signaling blob to the other DM participant(s)
+            // by piggybacking on the channel broadcast bus. The client
+            // filters these synthetic messages by `username == "__call"`.
+            let channel_id = v
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or("missing channel")?
+                .to_compact_string();
+            let kind = v.get("kind").and_then(Value::as_str).ok_or("missing kind")?;
+            // Whitelist the few signaling kinds we expect.
+            if !matches!(kind, "offer" | "answer" | "ice" | "ringing" | "end" | "busy" | "decline") {
+                return Err("invalid call kind".into());
+            }
+            let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
+            if !can_send(&ch, user_id) { return Err("not a member".into()); }
+            // Only allow on DM channels — group calls aren't supported.
+            if !matches!(ch.kind, ChannelKind::Dm) {
+                return Err("calls only allowed in DMs".into());
+            }
+            let username = state
+                .users
+                .get(&user_id)
+                .map(|e| e.value().username.to_string())
+                .unwrap_or_default();
+            let ev = json!({
+                "ev": "call",
+                "channel": channel_id,
+                "kind": kind,
+                "from": user_id,
+                "fromName": username,
+                "payload": v.get("payload").cloned().unwrap_or(Value::Null),
+            });
+            let _ = ch.tx.send(Arc::new(WireMsg {
+                id: 0,
+                channel: ch.id.clone(),
+                kind: MsgKind::System,
+                user_id,
+                username: CompactString::const_new("__call"),
+                avatar: CompactString::const_new(""),
+                color: CompactString::const_new(""),
+                ts: now_secs(),
+                text: ev.to_string(),
+                file: None,
+                reply_to: None,
+                edited_at: None,
+                deleted: false,
+            }));
         }
 
         "read" => {

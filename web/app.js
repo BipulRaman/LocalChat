@@ -85,10 +85,20 @@ function toast(msg, ms = 2500) {
 
 const E2EE = {
   kp: null,         // { privateKey, publicKey, publicJwk }
+  available: false, // false on insecure contexts (plain HTTP non-localhost)
   peerKeyCache: new Map(),  // userId → CryptoKey (imported peer pubkey)
   sharedCache: new Map(),   // userId → AES-GCM CryptoKey (derived)
 
   async init() {
+    // Web Crypto requires a secure context (HTTPS or localhost). On plain
+    // HTTP from a LAN IP, `crypto.subtle` is undefined → DMs will fall back
+    // to plaintext relayed by the server (still LAN-only).
+    if (!window.isSecureContext || !crypto.subtle) {
+      console.warn("E2EE disabled: insecure context (use HTTPS or localhost for end-to-end encryption)");
+      this.available = false;
+      return;
+    }
+    this.available = true;
     const stored = localStorage.getItem("localchat-e2ee-kp");
     if (stored) {
       try {
@@ -112,6 +122,7 @@ const E2EE = {
   myPubStr() { return this.kp ? JSON.stringify(this.kp.publicJwk) : ""; },
 
   async _derive(userId, peerPubKeyStr) {
+    if (!this.available || !this.kp) return null;
     if (this.sharedCache.has(userId)) return this.sharedCache.get(userId);
     let peerJwk;
     try { peerJwk = JSON.parse(peerPubKeyStr); } catch { return null; }
@@ -133,6 +144,7 @@ const E2EE = {
   },
 
   async encryptFor(peerId, peerPubStr, plaintext) {
+    if (!this.available) throw new Error("E2EE unavailable in this context");
     const key = await this._derive(peerId, peerPubStr);
     if (!key) throw new Error("peer has no E2EE key");
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -142,6 +154,7 @@ const E2EE = {
   },
 
   async tryDecrypt(peerId, peerPubStr, wire) {
+    if (!this.available) return null;
     if (typeof wire !== "string" || !wire.startsWith("e2e:v1:")) return null;
     const parts = wire.split(":");
     if (parts.length !== 4) return null;
@@ -326,6 +339,8 @@ function onUsers(list) {
   for (const u of list) {
     const prev = S.users.get(u.id);
     if (prev && prev.pubkey !== u.pubkey) E2EE.invalidatePeer(u.id);
+    // If a peer that previously had no key now has one, allow re-warn next time it's lost.
+    if (u.pubkey && _warnedNoKey && _warnedNoKey.has(u.id)) _warnedNoKey.delete(u.id);
   }
   S.users.clear();
   for (const u of list) S.users.set(u.id, u);
@@ -352,6 +367,10 @@ async function onWireMsg(m) {
   }
   if (m.username === "__read") {
     try { onRead(JSON.parse(m.text)); } catch {}
+    return;
+  }
+  if (m.username === "__call") {
+    try { onCallSignal(JSON.parse(m.text)); } catch {}
     return;
   }
   // Suppress noisy join/leave system messages.
@@ -482,11 +501,10 @@ function renderChannels() {
   for (const c of S.channels.values()) {
     if (c.kind === "dm") {
       if (tab === "channels") continue;
-      const otherId = (c.members || []).find((m) => m !== S.me.id);
-      const u = S.users.get(otherId);
+      const u = dmPeer(c);
       items.push({
         ch: c, kind: "dm",
-        name: u ? u.username : `user #${otherId}`,
+        name: u ? u.username : "unknown",
         avatar: u?.avatar || "?",
         color: u?.color || "var(--brand)",
         sub: "end-to-end encrypted",
@@ -848,6 +866,7 @@ function updateHeader() {
   const ch = S.channels.get(S.active);
   const title = $("chTitle"), sub = $("chSub"), badge = $("e2eeBadge"), composer = $("msgInput");
   const avSlot = $("chAvatar");
+  const callBtn = $("callBtn");
   if (!ch) return;
 
   if (ch.kind === "dm") {
@@ -861,6 +880,7 @@ function updateHeader() {
       avSlot.textContent = p?.avatar || (p?.username?.[0] || "?").toUpperCase();
       avSlot.classList.remove("hidden");
     }
+    if (callBtn) callBtn.classList.toggle("hidden", !p);
   } else {
     title.textContent = "#" + (ch.name || ch.id);
     sub.textContent = ch.kind === "lobby" ? "lobby \u00b7 everyone" : (ch.isPrivate ? "private channel" : "channel");
@@ -871,6 +891,7 @@ function updateHeader() {
       avSlot.textContent = "#";
       avSlot.classList.remove("hidden");
     }
+    if (callBtn) callBtn.classList.add("hidden");
   }
 }
 
@@ -911,8 +932,31 @@ function switchChannel(id) {
 
 function dmPeer(ch) {
   if (!ch || ch.kind !== "dm") return null;
-  const otherId = (ch.members || []).find((m) => m !== S.me.id);
-  return S.users.get(otherId) || null;
+  // First try by member UserId (works while peer is online with current id).
+  const otherId = (ch.members || []).find((m) => m !== S.me?.id);
+  const byId = otherId != null ? S.users.get(otherId) : null;
+  if (byId) return byId;
+  // Fall back to username from the channel's dmUsers (stable across reconnects).
+  if (ch.dmUsers && S.me) {
+    const myName = (S.me.username || "").toLowerCase();
+    const peerName = ch.dmUsers.find((n) => n && n.toLowerCase() !== myName);
+    if (peerName) {
+      // Try to find the live user record by username.
+      for (const u of S.users.values()) {
+        if (u.username && u.username.toLowerCase() === peerName.toLowerCase()) return u;
+      }
+      // Peer is offline — return a synthetic record so UI shows the name.
+      return {
+        id: otherId ?? -1,
+        username: peerName,
+        color: "var(--muted)",
+        avatar: peerName[0]?.toUpperCase() || "?",
+        pubkey: null,
+        offline: true,
+      };
+    }
+  }
+  return null;
 }
 
 // ── Sending ──────────────────────────────────────────────────────────
@@ -928,22 +972,35 @@ async function sendMessage(rawText) {
 
   let payload = text;
   if (ch.kind === "dm") {
-    const peer = dmPeer(ch);
-    if (!peer || !peer.pubkey) {
-      toast("Peer has no encryption key — message not sent");
-      return;
-    }
-    try {
-      payload = await E2EE.encryptFor(peer.id, peer.pubkey, text);
-    } catch (e) {
-      toast("Encryption failed: " + e.message);
-      return;
+    const peer = dmPeer(ch); // may be null if peer is offline
+    const peerId = peer?.id ?? (ch.members || []).find((m) => m !== S.me?.id);
+    if (peer && peer.pubkey && E2EE.available) {
+      try {
+        payload = await E2EE.encryptFor(peer.id, peer.pubkey, text);
+      } catch (e) {
+        toast("Encryption failed: " + e.message);
+        return;
+      }
+    } else {
+      // Peer is offline, has no key, or our browser can't do Web Crypto.
+      // Send plaintext (server still relays + persists). Warn once per peer.
+      const key = peerId ?? "_unknown";
+      if (!_warnedNoKey.has(key)) {
+        _warnedNoKey.add(key);
+        const why = !peer
+          ? "Recipient is offline — sending unencrypted"
+          : (!E2EE.available
+            ? "Encryption unavailable here (use HTTPS or localhost) — sending unencrypted"
+            : `${peer.username} has no encryption key — sending unencrypted`);
+        toast(why);
+      }
     }
   }
 
   sendOp({ op: "send", channel: S.active, text: payload });
   sendOp({ op: "typing", channel: S.active, typing: false });
 }
+const _warnedNoKey = new Set();
 
 // Composer
 const msgInput = $("msgInput");
@@ -1260,7 +1317,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 // expose for inline onclick handlers
-Object.assign(window, { openCreateChannel, openDmPicker, closeModal, createChannel, toggleSidebar, toggleTheme });
+Object.assign(window, { openCreateChannel, openDmPicker, closeModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker });
 
 // ── Theme ────────────────────────────────────────────────────────────
 function toggleTheme() {
@@ -1281,3 +1338,310 @@ function updateThemeIcon() {
   }
 }
 updateThemeIcon();
+
+// ═══════════════════════════════════════════════════════════════════
+// Audio call (WebRTC, 1:1 over a DM channel)
+// ───────────────────────────────────────────────────────────────────
+// Signaling piggybacks on the existing WS DM broadcast bus via the
+// `call_signal` op. The server tags relayed frames with
+// `username == "__call"` so onWireMsg routes them here.
+// ═══════════════════════════════════════════════════════════════════
+const Call = {
+  pc: null,           // RTCPeerConnection
+  localStream: null,  // MediaStream from getUserMedia
+  channelId: null,    // DM channel hosting this call
+  peerId: null,       // remote user id
+  peerName: "",
+  state: "idle",      // idle | calling | ringing | active
+  muted: false,
+  pendingIce: [],     // ICE arrived before remoteDescription was set
+};
+
+const RTC_CONFIG = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
+
+function callSend(kind, payload) {
+  if (!Call.channelId) return;
+  sendOp({ op: "call_signal", channel: Call.channelId, kind, payload: payload ?? null });
+}
+
+async function startCall() {
+  if (Call.state !== "idle") return;
+  const ch = S.channels.get(S.active);
+  if (!ch || ch.kind !== "dm") return;
+  const peer = dmPeer(ch);
+  if (!peer) return;
+  try {
+    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (e) {
+    toast("Mic permission denied: " + e.message);
+    return;
+  }
+  Call.channelId = ch.id;
+  Call.peerId = peer.id;
+  Call.peerName = peer.username;
+  Call.state = "calling";
+  showCallBar("Calling…");
+  await createPC();
+  // Add local audio tracks before creating offer.
+  for (const t of Call.localStream.getAudioTracks()) Call.pc.addTrack(t, Call.localStream);
+  const offer = await Call.pc.createOffer({ offerToReceiveAudio: true });
+  await Call.pc.setLocalDescription(offer);
+  callSend("offer", { sdp: Call.pc.localDescription });
+}
+
+async function createPC() {
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  Call.pc = pc;
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) callSend("ice", { candidate: ev.candidate });
+  };
+  pc.ontrack = (ev) => {
+    const audio = $("remoteAudio");
+    if (audio && ev.streams && ev.streams[0]) {
+      audio.srcObject = ev.streams[0];
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === "connected") {
+      Call.state = "active";
+      setCallStatus("Connected");
+    } else if (s === "failed" || s === "disconnected" || s === "closed") {
+      if (Call.state !== "idle") teardownCall(false);
+    }
+  };
+}
+
+async function acceptCall() {
+  if (Call.state !== "ringing") return;
+  stopRingtone();
+  $("incomingCall").classList.add("hidden");
+  try {
+    Call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (e) {
+    toast("Mic permission denied: " + e.message);
+    callSend("decline", null);
+    resetCallState();
+    return;
+  }
+  for (const t of Call.localStream.getAudioTracks()) Call.pc.addTrack(t, Call.localStream);
+  const answer = await Call.pc.createAnswer();
+  await Call.pc.setLocalDescription(answer);
+  callSend("answer", { sdp: Call.pc.localDescription });
+  showCallBar("Connecting…");
+  Call.state = "active";
+}
+
+function declineCall() {
+  if (Call.state !== "ringing") return;
+  stopRingtone();
+  callSend("decline", null);
+  $("incomingCall").classList.add("hidden");
+  resetCallState();
+}
+
+function endCall() {
+  if (Call.state === "idle") return;
+  callSend("end", null);
+  teardownCall(true);
+}
+
+function toggleMute() {
+  if (!Call.localStream) return;
+  Call.muted = !Call.muted;
+  for (const t of Call.localStream.getAudioTracks()) t.enabled = !Call.muted;
+  const btn = $("muteBtn");
+  if (btn) btn.classList.toggle("active", Call.muted);
+  setCallStatus(Call.muted ? "Muted" : (Call.state === "active" ? "Connected" : "Connecting…"));
+}
+
+async function toggleSpeaker() {
+  const audio = $("remoteAudio");
+  if (!audio) return;
+  Call._speakerState = !(Call._speakerState ?? true);
+  const speakerOn = Call._speakerState;
+  // Best-effort: pick a different audio output device when available.
+  try {
+    if (typeof audio.setSinkId === "function" && navigator.mediaDevices?.enumerateDevices) {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const outs = devs.filter((d) => d.kind === "audiooutput");
+      if (outs.length > 1) {
+        const target = speakerOn
+          ? (outs.find((d) => d.deviceId === "default") || outs[0])
+          : (outs.find((d) => d.deviceId !== "default") || outs[outs.length - 1]);
+        await audio.setSinkId(target.deviceId);
+      }
+    }
+  } catch {}
+  audio.volume = speakerOn ? 1.0 : 0.35;
+  const btn = $("speakerBtn");
+  if (btn) btn.classList.toggle("active", speakerOn);
+  toast(speakerOn ? "Speaker on" : "Speaker off");
+}
+
+function teardownCall(local) {
+  stopRingtone();
+  try { Call.pc?.close(); } catch {}
+  if (Call.localStream) {
+    for (const t of Call.localStream.getTracks()) t.stop();
+  }
+  const audio = $("remoteAudio");
+  if (audio) audio.srcObject = null;
+  $("callPanel").classList.add("hidden");
+  $("incomingCall").classList.add("hidden");
+  if (local !== true) toast("Call ended");
+  resetCallState();
+}
+
+function resetCallState() {
+  Call.pc = null;
+  Call.localStream = null;
+  Call.channelId = null;
+  Call.peerId = null;
+  Call.peerName = "";
+  Call.state = "idle";
+  Call.muted = false;
+  Call._speakerState = true;
+  Call.pendingIce = [];
+  const btn = $("muteBtn");
+  if (btn) btn.classList.remove("active");
+  const sbtn = $("speakerBtn");
+  if (sbtn) sbtn.classList.add("active");
+  const audio = $("remoteAudio");
+  if (audio) audio.volume = 1.0;
+}
+
+function showCallBar(status) {
+  const bar = $("callPanel");
+  $("cbName").textContent = Call.peerName || "Unknown";
+  const peer = S.users.get(Call.peerId);
+  const av = $("cbAvatar");
+  if (av) {
+    av.textContent = peer?.avatar || (Call.peerName?.[0] || "?").toUpperCase();
+    av.style.background = peer?.color || "var(--brand)";
+  }
+  setCallStatus(status);
+  bar.classList.remove("hidden");
+}
+
+function setCallStatus(s) {
+  const el = $("cbStatus");
+  if (el) el.textContent = s;
+}
+
+async function onCallSignal({ channel, kind, from, fromName, payload }) {
+  // Ignore our own echoes from the broadcast bus.
+  if (S.me && from === S.me.id) return;
+
+  if (kind === "offer") {
+    if (Call.state !== "idle") {
+      // Already busy with another call; politely decline.
+      sendOp({ op: "call_signal", channel, kind: "busy", payload: null });
+      return;
+    }
+    Call.channelId = channel;
+    Call.peerId = from;
+    Call.peerName = fromName || (S.users.get(from)?.username || "unknown");
+    Call.state = "ringing";
+    await createPC();
+    try {
+      await Call.pc.setRemoteDescription(payload.sdp);
+      await drainPendingIce();
+    } catch (e) {
+      console.warn("setRemoteDescription failed", e);
+      resetCallState();
+      return;
+    }
+    // Show the incoming-call modal.
+    const peer = S.users.get(from);
+    const av = $("icAvatar");
+    if (av) {
+      av.textContent = peer?.avatar || (Call.peerName?.[0] || "?").toUpperCase();
+      av.style.background = peer?.color || "var(--brand)";
+    }
+    $("icName").textContent = Call.peerName;
+    $("incomingCall").classList.remove("hidden");
+    startRingtone();
+    return;
+  }
+
+  // For all other kinds, must match the active call.
+  if (channel !== Call.channelId || from !== Call.peerId) return;
+
+  if (kind === "answer") {
+    try {
+      await Call.pc.setRemoteDescription(payload.sdp);
+      await drainPendingIce();
+      Call.state = "active";
+      setCallStatus("Connected");
+    } catch (e) {
+      console.warn("answer setRemoteDescription failed", e);
+    }
+  } else if (kind === "ice") {
+    const cand = payload?.candidate;
+    if (!cand) return;
+    if (Call.pc?.remoteDescription && Call.pc.remoteDescription.type) {
+      try { await Call.pc.addIceCandidate(cand); } catch (e) { console.warn("addIceCandidate", e); }
+    } else {
+      Call.pendingIce.push(cand);
+    }
+  } else if (kind === "end" || kind === "decline" || kind === "busy") {
+    const why = kind === "busy" ? "Peer is busy" : (kind === "decline" ? "Call declined" : "Call ended");
+    teardownCall(false);
+    toast(why);
+  }
+}
+
+async function drainPendingIce() {
+  while (Call.pendingIce.length) {
+    const c = Call.pendingIce.shift();
+    try { await Call.pc.addIceCandidate(c); } catch (e) { console.warn("drain ICE", e); }
+  }
+}
+
+// ── Ringtone (Web Audio, no asset needed) ────────────────────────────
+let _ringCtx = null;
+let _ringTimer = null;
+let _ringNodes = [];
+function startRingtone() {
+  stopRingtone();
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    _ringCtx = new Ctx();
+    const tone = () => {
+      const ctx = _ringCtx;
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      // Two short beeps per ring, like a classic phone bell.
+      for (let i = 0; i < 2; i++) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = 480 + (i % 2) * 140; // alternating 480/620 Hz
+        const t0 = now + i * 0.45;
+        const t1 = t0 + 0.32;
+        gain.gain.setValueAtTime(0, t0);
+        gain.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
+        gain.gain.setValueAtTime(0.18, t1 - 0.04);
+        gain.gain.linearRampToValueAtTime(0, t1);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0);
+        osc.stop(t1 + 0.05);
+        _ringNodes.push(osc, gain);
+      }
+    };
+    tone();
+    _ringTimer = setInterval(tone, 2500);
+  } catch (e) {
+    console.warn("ringtone failed", e);
+  }
+}
+function stopRingtone() {
+  if (_ringTimer) { clearInterval(_ringTimer); _ringTimer = null; }
+  for (const n of _ringNodes) { try { n.disconnect && n.disconnect(); } catch {} }
+  _ringNodes = [];
+  if (_ringCtx) { try { _ringCtx.close(); } catch {} _ringCtx = null; }
+}

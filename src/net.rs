@@ -67,7 +67,7 @@ pub fn print_banner(port: u16, addrs: &[String], state: &std::sync::Arc<crate::s
     println!();
     println!("  ✅  Server running. Keep this window / tray icon alive.");
     println!();
-    println!("  💻  This computer:   http://localhost:{port}");
+    println!("  💻  This computer:   https://localhost:{port}");
     if addrs.is_empty() {
         println!("  📡  LAN access:      (no LAN interface detected)");
     } else {
@@ -77,9 +77,12 @@ pub fn print_banner(port: u16, addrs: &[String], state: &std::sync::Arc<crate::s
             } else {
                 "                      "
             };
-            println!("{label}http://{ip}:{port}");
+            println!("{label}https://{ip}:{port}");
         }
     }
+    println!();
+    println!("  🔒  HTTPS uses a self-signed certificate. Accept the browser warning");
+    println!("      once per device — required for mic/camera + E2EE.");
     println!();
     println!("  📁  Data folder:     {}", state.app_root.display());
     println!("  📝  Log file:        {}", state.logs_dir.join("localchat.log").display());

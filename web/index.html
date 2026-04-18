@@ -141,6 +141,9 @@
             <svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 10V7a6 6 0 0112 0v3M5 10h14v10H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
             E2EE
           </span>
+          <button id="callBtn" class="icon-btn hidden" title="Audio call" aria-label="Start audio call" onclick="startCall()">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.13.96.37 1.9.72 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.91.35 1.85.59 2.81.72A2 2 0 0122 16.92z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
           <button id="themeToggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme" onclick="toggleTheme()" hidden></button>
         </div>
       </header>
@@ -208,6 +211,44 @@
 
   <!-- ═══════════════════ TOAST ═══════════════════ -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- ═══════════════════ AUDIO CALL UI ═══════════════════ -->
+  <div id="incomingCall" class="modal hidden" role="dialog" aria-labelledby="icTitle">
+    <div class="modal-panel call-panel">
+      <header class="modal-head">
+        <h3 id="icTitle">Incoming audio call</h3>
+      </header>
+      <div class="modal-body call-body">
+        <div class="call-avatar" id="icAvatar">?</div>
+        <div class="call-name" id="icName">Someone</div>
+        <div class="muted sm">is calling…</div>
+      </div>
+      <footer class="modal-foot call-foot">
+        <button type="button" class="btn btn-danger" onclick="declineCall()">Decline</button>
+        <button type="button" class="btn btn-primary" onclick="acceptCall()">Accept</button>
+      </footer>
+    </div>
+  </div>
+
+  <div id="callPanel" class="call-bar hidden" role="region" aria-label="Active call">
+    <div class="call-bar-info">
+      <div class="call-avatar small" id="cbAvatar">?</div>
+      <div>
+        <div class="call-name sm" id="cbName">…</div>
+        <div class="muted xs" id="cbStatus">Connecting…</div>
+      </div>
+    </div>
+    <div class="call-bar-actions">
+      <button id="muteBtn" class="icon-btn" title="Mute" aria-label="Mute" onclick="toggleMute()">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zM5 11a7 7 0 0014 0M12 18v4M8 22h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="speakerBtn" class="icon-btn active" title="Speaker" aria-label="Toggle speaker" onclick="toggleSpeaker()">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10v4a1 1 0 001 1h3l5 4V5L7 9H4a1 1 0 00-1 1z"/><path d="M16 8a5 5 0 010 8M19 5a9 9 0 010 14"/></svg>
+      </button>
+      <button class="btn btn-danger" onclick="endCall()" title="End call" aria-label="End call">End</button>
+    </div>
+    <audio id="remoteAudio" autoplay></audio>
+  </div>
 
   <script src="/app.js"></script>
 </body>

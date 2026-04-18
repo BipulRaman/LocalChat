@@ -47,17 +47,58 @@ pub async fn serve(
         .route("/uploads/:filename", get(serve_upload))
         .nest("/api/admin", admin::router())
         .fallback(serve_asset)
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     let _ = ready.send(port);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    // Serve everything over HTTPS on the chosen port (default 5000) so
+    // browsers grant getUserMedia / Web Crypto on LAN. A self-signed cert
+    // is auto-generated under <app_root>/tls/ on first run.
+    serve_tls(state, app, port).await
+}
+
+async fn serve_tls(
+    state: Arc<AppState>,
+    app: Router,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    // Initialize the rustls crypto provider once (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let tls_dir = state.app_root.join("tls");
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+
+    if !cert_path.exists() || !key_path.exists() {
+        std::fs::create_dir_all(&tls_dir)?;
+        let san = build_cert_sans();
+        let cert = rcgen::generate_simple_self_signed(san)?;
+        std::fs::write(&cert_path, cert.cert.pem())?;
+        std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
+        crate::applog::log(format_args!(
+            "tls: generated self-signed cert at {}", tls_dir.display()
+        ));
+    }
+
+    let cfg = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+    axum_server::bind_rustls(addr, cfg)
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await?;
     Ok(())
+}
+
+/// Subject-Alternative-Names that the cert should cover. Includes
+/// localhost, 127.0.0.1, and every detected LAN address so browsers
+/// don't yell about a hostname mismatch on first visit.
+fn build_cert_sans() -> Vec<String> {
+    let mut sans: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
+    for ip in crate::net::lan_addresses() {
+        sans.push(ip);
+    }
+    sans
 }
 
 // ── WS ───────────────────────────────────────────────────────────────
