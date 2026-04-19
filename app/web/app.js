@@ -280,11 +280,19 @@ function connect(username) {
       setStatus("warn", "reconnecting…");
       setTimeout(() => connect(S.me.username), Math.min(6000, 400 * S.reconnectTries));
     } else {
-      $("joinStatus").textContent = "Connection closed. Try again.";
+      const status = $("joinStatus");
+      // If the server already pushed a specific error (e.g. username taken),
+      // don't clobber it with a generic "Connection closed" line.
+      if (status && !status.classList.contains("err")) {
+        status.textContent = "Connection closed. Try again.";
+      }
     }
   };
   ws.onerror = () => {
-    $("joinStatus").textContent = "Cannot reach server.";
+    const status = $("joinStatus");
+    if (status && !status.classList.contains("err")) {
+      status.textContent = "Cannot reach server.";
+    }
   };
 }
 
@@ -315,10 +323,30 @@ function handleEvent(e) {
 
 function onError(e) {
   if (!S.me) {
-    // Server rejected our auto-join (e.g. banned, bad name). Drop the
-    // saved name so the join screen lets the user pick a new one.
+    // Server rejected our auto-join (banned, bad name, name taken, etc.).
+    // Drop the saved name so the user can pick a different one, surface
+    // the message in the join screen, and stop the reconnect loop.
     localStorage.removeItem("localchat-username");
-    $("joinStatus").textContent = e.text || "error";
+    const status = $("joinStatus");
+    if (status) {
+      status.textContent = e.text || "Could not join.";
+      status.classList.add("err");
+    }
+    if (e.code === "username_taken") {
+      const input = $("username");
+      if (input) {
+        input.value = "";
+        input.focus();
+        input.classList.add("err");
+        input.addEventListener("input", () => {
+          input.classList.remove("err");
+          if (status) { status.textContent = ""; status.classList.remove("err"); }
+        }, { once: true });
+      }
+    }
+    // Close the socket so the onclose handler doesn't try to reconnect
+    // with the same rejected name.
+    try { S.ws && S.ws.close(); } catch {}
     return;
   }
   toast(e.text || "Server error");

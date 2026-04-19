@@ -84,6 +84,39 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
         return;
     }
 
+    // ── Username ownership check ─────────────────────────────────────
+    // Once a username has been claimed by a browser (identified by its
+    // E2EE public key), only that same browser can re-use the name.
+    // Prevents trivial impersonation on a shared LAN.
+    let supplied_pub: CompactString = join.pubkey
+        .chars()
+        .take(512)
+        .collect::<String>()
+        .to_compact_string();
+    let key = username.to_lowercase().to_compact_string();
+    if let Some(existing_id) = state.username_to_id.get(&key).map(|v| *v) {
+        if let Some(prior) = state.known_users.get(&existing_id).map(|e| e.value().clone()) {
+            if !prior.pubkey.is_empty()
+                && (supplied_pub.is_empty() || supplied_pub != prior.pubkey)
+            {
+                let _ = sink
+                    .send(Message::Text(
+                        json!({
+                            "ev":"error",
+                            "text": format!(
+                                "Username \"{}\" is already taken on this server. Pick a different name.",
+                                username
+                            ),
+                            "code": "username_taken",
+                        }).to_string(),
+                    ))
+                    .await;
+                state.metrics.dec_connect();
+                return;
+            }
+        }
+    }
+
     let user_id = assign_user_id(&state, &username);
 
     // Restore previous identity (avatar/color/pubkey) if this user has
@@ -92,6 +125,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
         .known_users
         .get(&user_id)
         .map(|e| e.value().clone());
+
 
     let avatar = if !join.avatar.is_empty() {
         join.avatar.chars().take(4).collect::<String>().to_compact_string()
