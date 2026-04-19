@@ -8,7 +8,7 @@ One ~5 MB binary. No accounts. No cloud. No telemetry.
 Double-click. Share the LAN URL. Done.
 
 [![Build](../../actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/Bipulkr/LocalChat?label=download)](../../releases/latest)
+[![Release](https://img.shields.io/github/v/release/BipulRaman/LocalChat?label=download)](../../releases/latest)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-informational)
 

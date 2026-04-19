@@ -240,7 +240,6 @@ const S = {
   }
   fetch("/api/info").then((r) => r.json()).then((info) => {
     S.hostname = info.hostname || "";
-    const h = $("hostInfo"); if (h) h.textContent = `host: ${S.hostname}`;
   }).catch(() => {});
 
   // Auto-rejoin if we previously chose a username on this device.
@@ -1519,6 +1518,7 @@ function openCreateChannel() {
   $("newChName").focus();
 }
 function closeModal(id) { $(id).classList.add("hidden"); }
+function openModal(id) { const m = $(id); if (m) m.classList.remove("hidden"); }
 
 // ── Sidebar "+" menu (new channel / new DM) ─────────────────────────
 function toggleNewMenu(ev) {
@@ -1956,7 +1956,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 // expose for inline onclick handlers
-Object.assign(window, { openCreateChannel, openDmPicker, closeModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker, toggleCamera });
+Object.assign(window, { openCreateChannel, openDmPicker, closeModal, openModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker, toggleCamera });
 
 // ── Theme ────────────────────────────────────────────────────────────
 function toggleTheme() {
