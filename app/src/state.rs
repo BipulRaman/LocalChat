@@ -22,6 +22,7 @@ pub type EmojiKey = compact_str::CompactString;
 /// `end`/`decline`/`busy` arrives — at which point a system message
 /// summarizing the outcome is posted into the DM channel.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // callee_name + started_at populated for diagnostics / future audit
 pub struct CallSession {
     pub caller_id: UserId,
     pub caller_name: compact_str::CompactString,
@@ -113,9 +114,10 @@ impl AppState {
                 eprintln!("    Add-MpPreference -ControlledFolderAccessAllowedApplications '{}'", exe.display());
             }
             eprintln!();
-            eprintln!("  Or pick a different folder by deleting the pointer file");
-            eprintln!("  next to the exe (localchat.datadir) and restarting, or");
-            eprintln!("  set the LOCALCHAT_HOME environment variable.");
+            eprintln!("  Or pick a different folder by deleting the app config");
+            eprintln!("  (%APPDATA%\\LocalChat\\config.json on Windows, or");
+            eprintln!("  ~/.config/localchat/config.json elsewhere) and restarting,");
+            eprintln!("  or set the LOCALCHAT_HOME environment variable.");
             eprintln!();
             return Err(e);
         }
@@ -220,6 +222,7 @@ impl AppState {
         self.next_user_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[allow(dead_code)] // helper used by future admin endpoints
     pub async fn save_channel(&self, channel_id: &str) {
         if let Some(ch) = self.channels.get(channel_id) {
             let _ = self.db.upsert_channel(&ch.meta()).await;
@@ -235,37 +238,76 @@ fn resolve_app_root() -> PathBuf {
         }
     }
 
-    // 2. Pointer file next to the exe. Written on first run after the
-    //    interactive prompt so subsequent boots skip it. Users can
-    //    delete the pointer file to re-trigger the prompt, or edit it
-    //    to point at a different data directory.
-    let pointer = pointer_file_path();
-    if let Some(ref path) = pointer {
-        if let Ok(txt) = std::fs::read_to_string(path) {
-            let trimmed = txt.trim();
-            if !trimmed.is_empty() {
-                return PathBuf::from(trimmed);
+    // 2. App config in the OS-standard per-user location
+    //    (`%APPDATA%\LocalChat\config.json` on Windows,
+    //    `~/.config/localchat/config.json` on Unix). This survives
+    //    moving / replacing / re-installing the exe — the data folder
+    //    is remembered system-wide, not per-binary.
+    if let Some(dir) = read_app_config_data_dir() {
+        return dir;
+    }
+
+    // 3. No config yet — first-run setup via the user's web browser.
+    //    Spins up a tiny localhost HTTP server on an ephemeral port,
+    //    opens the default browser, and waits for the user to submit
+    //    the folder picker form. The chosen path is persisted to the
+    //    AppData config above so we never ask again.
+    let chosen = prompt_via_browser(&default_data_dir());
+    let _ = write_app_config_data_dir(&chosen);
+    chosen
+}
+
+/// Per-user app config path. Lives outside the data folder so it
+/// survives wipes of the data folder, AND outside the exe folder so
+/// it survives replacing/moving the binary.
+fn app_config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        // %APPDATA% = C:\Users\<u>\AppData\Roaming
+        if let Ok(roaming) = std::env::var("APPDATA") {
+            if !roaming.is_empty() {
+                return Some(PathBuf::from(roaming).join("LocalChat").join("config.json"));
             }
         }
-    }
-
-    // 3. First-run setup via the user's web browser. We spin up a
-    //    tiny localhost HTTP server on an ephemeral port, open the
-    //    default browser at it, and wait for the user to submit the
-    //    folder picker form. Default is a clean top-level folder NOT
-    //    covered by Windows Defender "Controlled Folder Access".
-    let default = default_data_dir();
-    let chosen = prompt_via_browser(&default);
-
-    // Persist the choice so we don't ask again.
-    if let Some(ref p) = pointer {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(d) = dirs::config_dir() {
+            return Some(d.join("LocalChat").join("config.json"));
         }
-        let _ = std::fs::write(p, chosen.to_string_lossy().as_bytes());
+        None
     }
+    #[cfg(not(windows))]
+    {
+        if let Some(d) = dirs::config_dir() {
+            return Some(d.join("localchat").join("config.json"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            return Some(home.join(".config").join("localchat").join("config.json"));
+        }
+        None
+    }
+}
 
-    chosen
+fn read_app_config_data_dir() -> Option<PathBuf> {
+    let path = app_config_path()?;
+    let txt = std::fs::read_to_string(&path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let dir = val.get("data_dir")?.as_str()?.trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(dir))
+}
+
+fn write_app_config_data_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let path = match app_config_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({ "data_dir": dir.to_string_lossy() });
+    std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap_or_default())?;
+    Ok(())
 }
 
 fn default_data_dir() -> PathBuf {
@@ -284,17 +326,6 @@ fn default_data_dir() -> PathBuf {
             PathBuf::from("./LocalChat")
         }
     }
-}
-
-/// Where we store the "which data dir did the user pick" pointer.
-/// Next to the exe so it travels with the binary; falls back to cwd.
-fn pointer_file_path() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return Some(parent.join("localchat.datadir"));
-        }
-    }
-    Some(std::env::current_dir().ok()?.join("localchat.datadir"))
 }
 
 /// First-run setup via a localhost web page. Binds an ephemeral port,
@@ -360,7 +391,7 @@ fn prompt_via_browser(default: &std::path::Path) -> PathBuf {
   .warn{{font-size:13px;color:#92400e;background:#fef3c7;padding:10px 12px;border-radius:8px;margin-top:18px;}}
 </style></head><body>
 <h1>LocalChat — first-run setup</h1>
-<p>Pick a folder where LocalChat will keep its database, uploads, logs, and TLS certificate. You can change this later by editing <code>localchat.datadir</code> next to the executable.</p>
+<p>Pick a folder where LocalChat will keep its database, uploads, logs, and TLS certificate. You can change this later by editing <code>%APPDATA%\LocalChat\config.json</code> (Windows) or <code>~/.config/localchat/config.json</code>.</p>
 <form method="POST" action="/setup">
   <label for="path">Data folder</label>
   <input id="path" name="path" type="text" value="{default_attr}" autofocus spellcheck="false">

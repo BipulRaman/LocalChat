@@ -103,6 +103,7 @@ impl Channel {
         h.push_back(msg);
     }
 
+    #[allow(dead_code)] // kept for tests / future use
     pub async fn recent(&self, limit: usize) -> Vec<Arc<WireMsg>> {
         let h = self.history.read().await;
         let start = h.len().saturating_sub(limit);
@@ -293,6 +294,7 @@ impl ChannelRegistry {
 
     /// Snapshot every persistent channel (groups + DMs) for disk storage.
     /// The lobby is recreated on each boot, so we skip it.
+    #[allow(dead_code)] // retained for ad-hoc backups / debugging
     pub fn snapshot_for_disk(&self) -> Vec<ChannelMeta> {
         self.map
             .iter()

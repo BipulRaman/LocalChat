@@ -269,6 +269,7 @@ impl Db {
 impl Db {
     /// Look up a user by case-insensitive username. Returns None if the
     /// name has never been seen on this server.
+    #[allow(dead_code)] // public API surface, not currently called
     pub async fn user_by_username(&self, username: &str) -> rusqlite::Result<Option<UserInfo>> {
         let lname = username.to_lowercase();
         self.with(move |c| {
@@ -285,6 +286,7 @@ impl Db {
         .await
     }
 
+    #[allow(dead_code)] // public API surface, not currently called
     pub async fn user_by_id(&self, id: UserId) -> rusqlite::Result<Option<UserInfo>> {
         self.with(move |c| {
             c.query_row(
@@ -726,6 +728,7 @@ impl Db {
         .await
     }
 
+    #[allow(dead_code)] // available for admin tooling
     pub async fn delete_messages_in_channel(&self, channel: &str) -> rusqlite::Result<()> {
         let cid = channel.to_string();
         self.with(move |c| {
