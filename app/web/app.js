@@ -742,6 +742,35 @@ function deleteDm(channelId) {
   sendOp({ op: "dm_delete", channel: channelId });
 }
 
+// Click an author name / avatar in any channel to open (or jump into)
+// a DM with that user. Falls back to looking the user up by username
+// when we don't have a live id.
+function openDmWithUserId(userId, username) {
+  if (S.me && (userId === S.me.id || username === S.me.username)) return;
+  // If a DM channel with this user already exists locally, just switch.
+  const existing = [...S.channels.values()].find((c) => {
+    if (c.kind !== "dm") return null;
+    if (userId != null && (c.members || []).includes(userId)) return c;
+    if (username && c.dmUsers) {
+      const ln = (username || "").toLowerCase();
+      return c.dmUsers.some((n) => (n || "").toLowerCase() === ln) ? c : null;
+    }
+    return null;
+  });
+  if (existing) { switchChannel(existing.id); return; }
+  // Otherwise ask the server to open a fresh DM. Prefer userId; fall back
+  // to a username lookup against current presence.
+  let id = userId;
+  if (id == null && username) {
+    const ln = username.toLowerCase();
+    const u = [...S.users.values()].find((x) => (x.username || "").toLowerCase() === ln);
+    id = u?.id;
+  }
+  if (id == null) { toast(`${username || "user"} is offline`); return; }
+  sendOp({ op: "dm_open", user: id });
+}
+Object.assign(window, { openDmWithUserId });
+
 function _personItem(u, online) {
   return el("li", {
     class: "chat-item",
@@ -958,10 +987,15 @@ async function renderMessage(m, { follow, peer, ch }) {
   if (isOwn || isDm || follow) {
     avatar = el("div", { class: "avatar-spacer" });
   } else {
-    avatar = el("div", {
-      class: "avatar",
+    avatar = el("button", {
+      type: "button",
+      class: "avatar avatar-link",
       style: `background:${m.color || "#6366f1"}`,
-      title: m.username,
+      title: `Message ${m.username}`,
+      onclick: (ev) => {
+        ev.stopPropagation();
+        openDmWithUserId(m.userId, m.username);
+      },
     }, m.avatar || "?");
   }
 
@@ -976,10 +1010,17 @@ async function renderMessage(m, { follow, peer, ch }) {
   const showAuthor = !follow && !isOwn && !isDm;
   if (!follow) {
     if (showAuthor) {
+      const authorIsMe = m.userId === S.me?.id;
       header = el("div", { class: "msg-header" }, [
-        el("span", {
-          class: "author",
+        el(authorIsMe ? "span" : "button", {
+          type: authorIsMe ? undefined : "button",
+          class: "author" + (authorIsMe ? "" : " author-link"),
           style: `color:${m.color || "var(--brand)"}`,
+          title: authorIsMe ? m.username : `Message ${m.username}`,
+          onclick: authorIsMe ? undefined : (ev) => {
+            ev.stopPropagation();
+            openDmWithUserId(m.userId, m.username);
+          },
         }, m.username),
         el("span", { class: "header-time" }, fmtTime(m.ts)),
       ]);

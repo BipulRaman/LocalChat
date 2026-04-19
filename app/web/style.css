@@ -664,6 +664,22 @@ input:focus, textarea:focus {
   font-size: 12.5px;
   font-weight: 600;
 }
+.msg-header button.author-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.msg-header button.author-link:hover { text-decoration: underline; }
+.avatar.avatar-link {
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  transition: transform var(--transition), box-shadow var(--transition);
+}
+.avatar.avatar-link:hover { transform: scale(1.06); box-shadow: 0 0 0 2px var(--brand-soft); }
 .msg-header .header-time {
   font-size: 10.5px;
   white-space: nowrap;
