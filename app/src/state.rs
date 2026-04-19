@@ -197,17 +197,26 @@ impl AppState {
 }
 
 fn resolve_app_root() -> PathBuf {
+    // Explicit override wins.
     if let Ok(p) = std::env::var("LOCALCHAT_HOME") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
+    // Prefer a folder next to the running exe. This avoids Windows
+    // "Controlled Folder Access" (ransomware protection) blocking
+    // writes into %APPDATA% for un-whitelisted binaries during
+    // development, which otherwise silently drops DB inserts and
+    // file uploads.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("localchat-data");
+        }
+    }
     if let Some(d) = dirs::data_dir() {
         return d.join("LocalChat");
     }
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    exe_dir.join("localchat-data")
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("localchat-data")
 }

@@ -505,7 +505,9 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_
                         deleted: false,
                     });
                     ch.push_history(msg.clone()).await;
-                    let _ = state.db.insert_message(&msg).await;
+                    if let Err(e) = state.db.insert_message(&msg).await {
+                        crate::applog::log(format_args!("db.insert_message FAILED (call-end system): {e}"));
+                    }
                     let _ = ch.tx.send(msg);
                 }
             }
@@ -650,7 +652,9 @@ async fn broadcast_system(state: &Arc<AppState>, ch: &Channel, text: &str) {
         deleted: false,
     });
     ch.push_history(msg.clone()).await;
-    let _ = state.db.insert_message(&msg).await;
+    if let Err(e) = state.db.insert_message(&msg).await {
+        crate::applog::log(format_args!("db.insert_message FAILED (system broadcast): {e}"));
+    }
     let _ = ch.tx.send(msg);
 }
 
@@ -736,7 +740,9 @@ async fn handle_op(
                 deleted: false,
             });
             ch.push_history(msg.clone()).await;
-            let _ = state.db.insert_message(&msg).await;
+            if let Err(e) = state.db.insert_message(&msg).await {
+                crate::applog::log(format_args!("db.insert_message FAILED (send): {e}"));
+            }
             state.metrics.inc_messages();
             bump_user_msg_count(state, user_id);
             let _ = state.db.bump_user_msg_count(user_id).await;
@@ -791,7 +797,9 @@ async fn handle_op(
             });
             ch.push_history(msg.clone()).await;
             let file_size = msg.file.as_ref().map(|f| f.size).unwrap_or(0);
-            let _ = state.db.insert_message(&msg).await;
+            if let Err(e) = state.db.insert_message(&msg).await {
+                crate::applog::log(format_args!("db.insert_message FAILED (file op): {e}"));
+            }
             if file_size > 0 {
                 let _ = state.db.bump_user_uploaded(user_id, file_size).await;
             }
@@ -1329,7 +1337,9 @@ async fn handle_op(
                             deleted: false,
                         });
                         ch.push_history(msg.clone()).await;
-                        let _ = state.db.insert_message(&msg).await;
+                        if let Err(e) = state.db.insert_message(&msg).await {
+                            crate::applog::log(format_args!("db.insert_message FAILED (call system): {e}"));
+                        }
                         let _ = ch.tx.send(msg);
                     }
                 }

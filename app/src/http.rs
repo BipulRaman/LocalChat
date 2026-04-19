@@ -409,7 +409,10 @@ async fn upload(
         deleted: false,
     });
     ch.push_history(msg.clone()).await;
-    let _ = state.db.insert_message(&msg).await;
+    if let Err(e) = state.db.insert_message(&msg).await {
+        crate::applog::log(format_args!("db.insert_message FAILED (upload): {e}"));
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("db write failed: {e}")));
+    }
     if let Some(cid) = client_id.as_deref() {
         let _ = state.db.set_message_client_id(msg.id, cid).await;
     }
