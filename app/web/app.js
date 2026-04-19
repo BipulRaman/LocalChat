@@ -182,6 +182,32 @@ const E2EE = {
       return null;
     }
   },
+
+  // Encrypt arbitrary bytes for a DM peer. Returns { iv, ct } as Uint8Arrays.
+  // Used for end-to-end encrypting file bodies before they hit /api/upload.
+  async encryptBytesFor(peerId, peerPubStr, bytes) {
+    if (!this.available) throw new Error("E2EE unavailable in this context");
+    const key = await this._derive(peerId, peerPubStr);
+    if (!key) throw new Error("peer has no E2EE key");
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv }, key, bytes,
+    ));
+    return { iv, ct };
+  },
+
+  // Decrypt previously-encrypted bytes from a DM peer.
+  async decryptBytesFrom(peerId, peerPubStr, iv, ct) {
+    if (!this.available) return null;
+    try {
+      const key = await this._derive(peerId, peerPubStr);
+      if (!key) return null;
+      const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+      return new Uint8Array(pt);
+    } catch {
+      return null;
+    }
+  },
 };
 
 function b64(buf) {
@@ -195,6 +221,33 @@ function unb64(s) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+// ── E2EE file body decrypt cache ─────────────────────────────────────
+// Keyed by the storage filename (which is unique per upload). Returns a
+// blob: URL pointing at the decrypted bytes so <img>/<video>/<audio>/<a>
+// can use them transparently. Misses fetch+decrypt once and memoize.
+const _e2eeBlobUrlCache = new Map();
+const _e2eeBlobUrlPending = new Map();
+async function getDecryptedBlobUrl(storageName, fetchUrl, envelope, peer) {
+  if (_e2eeBlobUrlCache.has(storageName)) return _e2eeBlobUrlCache.get(storageName);
+  if (_e2eeBlobUrlPending.has(storageName)) return _e2eeBlobUrlPending.get(storageName);
+  if (!peer || !peer.pubkey || !envelope?.iv) return null;
+  const promise = (async () => {
+    const res = await fetch(fetchUrl, { cache: "force-cache" });
+    if (!res.ok) throw new Error(`fetch ${storageName} failed: ${res.status}`);
+    const ct = new Uint8Array(await res.arrayBuffer());
+    const iv = unb64(envelope.iv);
+    const pt = await E2EE.decryptBytesFrom(peer.id, peer.pubkey, iv, ct);
+    if (!pt) throw new Error("decrypt failed");
+    const blob = new Blob([pt], { type: envelope.mime || "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    _e2eeBlobUrlCache.set(storageName, url);
+    return url;
+  })();
+  _e2eeBlobUrlPending.set(storageName, promise);
+  try { return await promise; }
+  finally { _e2eeBlobUrlPending.delete(storageName); }
 }
 
 // ── State ────────────────────────────────────────────────────────────
@@ -227,17 +280,12 @@ const S = {
     navigator.mediaDevices.addEventListener("devicechange", () => updateSpeakerIcon().catch(() => {}));
   }
 
-  // Track on-screen keyboard (mobile) via visualViewport so the layout
-  // shrinks correctly and the emoji popover/composer stay visible.
-  if (window.visualViewport) {
-    const setVV = () => {
-      const vv = window.visualViewport;
-      document.documentElement.style.setProperty("--vv-h", `${vv.height}px`);
-    };
-    setVV();
-    window.visualViewport.addEventListener("resize", setVV);
-    window.visualViewport.addEventListener("scroll", setVV);
-  }
+  // Mobile keyboard handling is delegated to CSS `100dvh` (dynamic
+  // viewport units), which Chrome 108+ / Safari 15.4+ resize correctly
+  // when the soft keyboard opens. We used to override with a
+  // visualViewport-driven `--vv-h`, but that fought Android Chrome's
+  // own scroll-into-view behaviour and left the composer stranded mid-
+  // viewport. `dvh` is simpler and more reliable.
   fetch("/api/info").then((r) => r.json()).then((info) => {
     S.hostname = info.hostname || "";
   }).catch(() => {});
@@ -271,6 +319,8 @@ function connect(username) {
       username,
       pubkey: E2EE.myPubStr(),
     }));
+    // Drain anything that was queued while the socket was down.
+    flushOutbox();
   };
   ws.onmessage = (ev) => handleEvent(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -315,10 +365,25 @@ function handleEvent(e) {
     case "ch_created":   return onChannelCreated(e.channel);
     case "ch_invited":   return onChannelInvited(e);
     case "ch_deleted":   return onChannelDeleted(e.channel);
+    case "kicked":       return onKicked(e);
     case "error":        return onError(e);
     case "pong":         return;
     default:             console.debug("[ev]", e);
   }
+}
+
+// The server tells us we've been disconnected by an admin (kick, ban,
+// or a flush/reset). Drop our identity, show a one-shot notice, and let
+// the natural reconnect loop bring up the join screen.
+function onKicked(e) {
+  const reason = (e && e.text) || (e && e.reason) || "removed by administrator";
+  try { localStorage.removeItem("localchat-username"); } catch {}
+  S.me = null;
+  setStatus("warn", "Kicked");
+  if (typeof toast === "function") toast("Disconnected: " + reason);
+  // Force a clean reconnect so the join screen reappears.
+  try { S.ws && S.ws.close(); } catch {}
+  setTimeout(() => location.reload(), 1500);
 }
 
 function onError(e) {
@@ -354,6 +419,7 @@ function onError(e) {
 
 function onWelcome(e) {
   S.me = e.user;
+  S.session = e.session || null;
   S.reconnectTries = 0;
   setStatus("ok", "online");
 
@@ -455,6 +521,9 @@ async function onWireMsg(m) {
   if (m.kind === "system" && /\b(joined|left) the chat\b/.test(m.text || "")) {
     return;
   }
+  // If this is the server echoing back a file we just queued, drop the
+  // queued copy so we don't replay it on the next reload.
+  if (m.kind === "file" && m.file?.id) ackOutboxFile(m.file.id);
   const arr = S.msgs.get(m.channel) || [];
   arr.push(m);
   S.msgs.set(m.channel, arr);
@@ -477,6 +546,11 @@ async function onHistory({ channel, messages, reactions }) {
   );
   S.msgs.set(channel, filtered);
   S.hasHistory.add(channel);
+  // Drop any queued file ops that the server already accepted (their
+  // resulting WireMsg is now visible in history).
+  for (const m of filtered) {
+    if (m.kind === "file" && m.file?.id) ackOutboxFile(m.file.id);
+  }
   // Hydrate reactions for this channel.
   const rmap = new Map();
   if (reactions && typeof reactions === "object") {
@@ -593,11 +667,15 @@ function onTyping({ channel, userId, username, typing }) {
 // ── Rendering ────────────────────────────────────────────────────────
 
 // Collapsed state for sidebar groups, persisted across reloads.
-const SB_COLLAPSE_KEY = "localchat-sb-collapsed";
+// Key bumped to v2 so any previously-collapsed groups reopen on first
+// load after the upgrade — sections start fully expanded by default.
+const SB_COLLAPSE_KEY = "localchat-sb-collapsed-v2";
 const _sbCollapsed = (() => {
   try { return new Set(JSON.parse(localStorage.getItem(SB_COLLAPSE_KEY) || "[]")); }
   catch { return new Set(); }
 })();
+// One-time cleanup of the v1 key so it doesn't keep haunting localStorage.
+try { localStorage.removeItem("localchat-sb-collapsed"); } catch {}
 function _sbToggle(key, open) {
   if (open) _sbCollapsed.delete(key); else _sbCollapsed.add(key);
   localStorage.setItem(SB_COLLAPSE_KEY, JSON.stringify([..._sbCollapsed]));
@@ -976,6 +1054,7 @@ async function renderMessage(m, { follow, peer, ch }) {
   // Decrypt DM ciphertext when possible.
   let displayText = m.text || "";
   let encrypted = false;
+  let fileRealName = null;
   if (peer && displayText.startsWith("e2e:v1:")) {
     const pt = await E2EE.tryDecrypt(peer.id, peer.pubkey, displayText);
     if (pt != null) { displayText = pt; encrypted = true; }
@@ -1016,7 +1095,15 @@ async function renderMessage(m, { follow, peer, ch }) {
         t = pt != null ? pt : "🔒 (encrypted)";
       }
       if (orig.kind === "file") {
-        t = orig.file?.originalName ? `📎 ${orig.file.originalName}` : "📎 attachment";
+        // Prefer the E2EE envelope's real name when present.
+        let fileName = orig.file?.originalName;
+        if (peer && t && t.startsWith("{")) {
+          try {
+            const env = JSON.parse(t);
+            if (env && env.v === 1 && env.kind === "file" && env.name) fileName = env.name;
+          } catch {}
+        }
+        t = fileName ? `📎 ${fileName}` : "📎 attachment";
       }
       quoteText = t.length > 160 ? t.slice(0, 160) + "…" : (t || "(empty)");
     }
@@ -1065,33 +1152,117 @@ async function renderMessage(m, { follow, peer, ch }) {
 
   if (m.kind === "file" && m.file) {
     const f = m.file;
-    const isImg = (f.mimeType || "").startsWith("image/");
-    const dlUrl   = `/api/download/${encodeURIComponent(f.filename)}?name=${encodeURIComponent(f.originalName)}`;
+    // Detect a DM E2EE envelope. When present, displayText is the JSON
+    // metadata that tells us the real name/mime + the AES-GCM IV used
+    // to encrypt the body.
+    let envelope = null;
+    if (peer && displayText && displayText.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(displayText);
+        if (parsed && parsed.v === 1 && parsed.kind === "file" && parsed.iv) {
+          envelope = parsed;
+          // Don't render the JSON as a caption.
+          displayText = "";
+        }
+      } catch {}
+    }
+
+    const realName = envelope?.name || f.originalName;
+    fileRealName = realName;
+    const realMime = envelope?.mime || f.mimeType || "";
+    const isImg   = realMime.startsWith("image/");
+    const isVideo = realMime.startsWith("video/");
+    const isAudio = realMime.startsWith("audio/");
+    const dlUrl   = `/api/download/${encodeURIComponent(f.filename)}?name=${encodeURIComponent(realName)}`;
     const viewUrl = `/uploads/${encodeURIComponent(f.filename)}`;
     const att = el("div", { class: "attachment" });
 
+    // For E2EE attachments, swap viewUrl/dlUrl for blob URLs after
+    // decrypt completes. We start with a placeholder src and patch it
+    // in once the bytes are ready.
+    const finalize = async (mediaEl, downloadAnchors) => {
+      if (!envelope) return;
+      try {
+        const url = await getDecryptedBlobUrl(f.filename, viewUrl, envelope, peer);
+        if (!url) return;
+        if (mediaEl) mediaEl.src = url;
+        for (const a of downloadAnchors) {
+          a.href = url;
+          a.setAttribute("download", realName);
+        }
+      } catch (err) {
+        console.warn("e2ee file decrypt failed", err);
+      }
+    };
+
     if (isImg) {
-      const img = el("img", { src: viewUrl, alt: f.originalName, loading: "lazy" });
+      const img = el("img", { src: envelope ? "" : viewUrl, alt: realName, loading: "lazy" });
+      const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
       const wrap = el("div", { class: "image-att", title: "Click to expand" }, [
         img,
         el("div", { class: "img-meta" }, [
-          el("span", {}, f.originalName),
-          el("a", { href: dlUrl, onclick: (e) => e.stopPropagation() }, "Download"),
+          el("span", {}, realName),
+          dlA,
         ]),
       ]);
-      wrap.addEventListener("click", () => openLightbox(viewUrl, f.originalName, dlUrl));
+      wrap.addEventListener("click", async () => {
+        if (envelope) {
+          const url = await getDecryptedBlobUrl(f.filename, viewUrl, envelope, peer);
+          if (url) openLightbox(url, realName, url);
+        } else {
+          openLightbox(viewUrl, realName, dlUrl);
+        }
+      });
       att.append(wrap);
+      finalize(img, [dlA]);
+    } else if (isVideo) {
+      const video = el("video", {
+        src: envelope ? "" : viewUrl,
+        controls: "",
+        preload: "metadata",
+        playsinline: "",
+        onclick: (e) => e.stopPropagation(),
+      });
+      const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
+      att.append(el("div", { class: "video-att" }, [
+        video,
+        el("div", { class: "img-meta" }, [
+          el("span", {}, realName),
+          dlA,
+        ]),
+      ]));
+      finalize(video, [dlA]);
+    } else if (isAudio) {
+      const audio = el("audio", {
+        src: envelope ? "" : viewUrl,
+        controls: "",
+        preload: "metadata",
+        onclick: (e) => e.stopPropagation(),
+      });
+      const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
+      att.append(el("div", { class: "audio-att" }, [
+        audio,
+        el("div", { class: "img-meta" }, [
+          el("span", {}, realName),
+          dlA,
+        ]),
+      ]));
+      finalize(audio, [dlA]);
     } else {
-      att.append(el("a", {
-        class: "file", href: dlUrl, target: "_blank", rel: "noopener",
+      const dlA = el("a", {
+        class: "file", href: envelope ? "" : dlUrl,
+        target: envelope ? undefined : "_blank",
+        rel: "noopener",
       }, [
-        el("div", { class: "file-icon" }, fileExt(f.originalName)),
+        el("div", { class: "file-icon" }, fileExt(realName)),
         el("div", { class: "file-meta" }, [
-          el("div", { class: "file-name" }, f.originalName),
-          el("div", { class: "file-sub" }, fmtSize(f.size)),
+          el("div", { class: "file-name" }, realName),
+          el("div", { class: "file-sub" }, fmtSize(envelope?.size || f.size)),
         ]),
         el("div", { class: "file-dl", html: `<svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 4v12m0 0l-5-5m5 5l5-5M4 20h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>` }),
-      ]));
+      ]);
+      att.append(dlA);
+      finalize(null, [dlA]);
     }
     bubble.append(att);
     if (displayText) {
@@ -1142,7 +1313,7 @@ async function renderMessage(m, { follow, peer, ch }) {
     el("button", {
       class: "ma-btn",
       title: "Reply",
-      onclick: (ev) => { ev.stopPropagation(); startReplyTo(m, displayText); },
+      onclick: (ev) => { ev.stopPropagation(); startReplyTo(m, displayText, fileRealName); },
       html: `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M10 9V5l-7 7 7 7v-4c5 0 8 1.5 10 5-1-7-5-11-10-11z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>`,
     }),
   ]);
@@ -1356,6 +1527,77 @@ function sendOp(obj) {
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
 }
 
+// Outbox for ops that MUST reach the server. Anything queued here is
+// flushed once the WS reconnects + re-joins. Use for user-visible work
+// the user thinks already "happened" (sending a chat message,
+// announcing an uploaded file). Transient ops (typing, history,
+// presence) intentionally use plain sendOp and are dropped if the
+// socket is down.
+//
+// Persisted to localStorage so a page refresh during an in-flight
+// upload still posts the file message once we reconnect.
+const _OUTBOX_KEY = "lc:outbox:v1";
+function _loadOutbox() {
+  try { return JSON.parse(localStorage.getItem(_OUTBOX_KEY) || "[]"); }
+  catch { return []; }
+}
+function _saveOutbox() {
+  try { localStorage.setItem(_OUTBOX_KEY, JSON.stringify(_outbox)); } catch {}
+}
+const _outbox = _loadOutbox();
+function sendOpReliable(obj) {
+  if (S.ws && S.ws.readyState === 1) {
+    S.ws.send(JSON.stringify(obj));
+    return true;
+  }
+  _outbox.push(obj);
+  _saveOutbox();
+  toast("Offline — will send when reconnected…", 3000);
+  return false;
+}
+// Stronger guarantee for ops where losing the message is unacceptable
+// (file uploads): always queue first, send, and only drop the entry
+// when the server echoes the resulting WireMsg back. The server
+// dedupes by file_id so replays after a refresh are safe.
+function queueAndSend(obj) {
+  _outbox.push(obj);
+  _saveOutbox();
+  if (S.ws && S.ws.readyState === 1) {
+    try { S.ws.send(JSON.stringify(obj)); } catch {}
+  }
+}
+function ackOutboxFile(fileId) {
+  if (!fileId) return;
+  const before = _outbox.length;
+  for (let i = _outbox.length - 1; i >= 0; i--) {
+    const o = _outbox[i];
+    if (o && o.op === "file" && o.file && o.file.id === fileId) {
+      _outbox.splice(i, 1);
+    }
+  }
+  if (_outbox.length !== before) _saveOutbox();
+}
+function flushOutbox() {
+  // Re-send everything currently queued. Items remain queued until
+  // explicitly acked (file ops) or until the WS frame is flushed for
+  // fire-and-forget items (text sends).
+  if (!S.ws || S.ws.readyState !== 1) return;
+  // Snapshot to avoid mutation during send.
+  const items = _outbox.slice();
+  let nonFileDrained = false;
+  for (const obj of items) {
+    try { S.ws.send(JSON.stringify(obj)); }
+    catch { return; }
+    // Text ops auto-drop after send (they're idempotent enough; the
+    // user sees the optimistic UI). File ops stay until echo.
+    if (obj.op !== "file") {
+      const idx = _outbox.indexOf(obj);
+      if (idx >= 0) { _outbox.splice(idx, 1); nonFileDrained = true; }
+    }
+  }
+  if (nonFileDrained) _saveOutbox();
+}
+
 async function sendMessage(rawText) {
   const text = rawText.trim();
   if (!text) return;
@@ -1391,17 +1633,18 @@ async function sendMessage(rawText) {
 
   const op = { op: "send", channel: S.active, text: payload };
   if (S.replyTo && S.replyTo.channelId === S.active) op.replyTo = S.replyTo.msgId;
-  sendOp(op);
+  sendOpReliable(op);
   sendOp({ op: "typing", channel: S.active, typing: false });
   clearReplyTo();
 }
 
 // ── Reply-to ──────────────────────────────────────────────────────────
-function startReplyTo(m, plainText) {
+function startReplyTo(m, plainText, fileRealName) {
   if (!m || m.kind === "system") return;
   const txt = (plainText != null ? plainText : (m.text || "")).toString();
+  const fileName = fileRealName || m.file?.originalName;
   const preview = m.kind === "file"
-    ? (m.file?.originalName ? `📎 ${m.file.originalName}` : "📎 attachment")
+    ? (fileName ? `📎 ${fileName}` : "📎 attachment")
     : (txt.length > 140 ? txt.slice(0, 140) + "…" : txt);
   S.replyTo = {
     channelId: m.channel,
@@ -1484,32 +1727,14 @@ function autoGrow(ta) {
 
 // File uploads — note: file content itself travels over HTTP (not WS).
 // For group/lobby channels the file lives in /uploads/ and admin CAN see
-// it. We do NOT encrypt file bodies for DMs in v1 — that would require a
-// much heavier scheme. A non-encrypted file in a DM is flagged in the UI.
+// it. For DMs we encrypt the bytes client-side with the same ECDH-derived
+// AES-GCM key used for text, so the server only stores opaque ciphertext.
+// The original filename + mime travel inside an E2EE envelope in `text`.
 $("fileInput").addEventListener("change", async (e) => {
   const f = e.target.files?.[0];
   if (!f) return;
-  const ch = S.channels.get(S.active);
-  if (ch?.kind === "dm") {
-    if (!confirm(
-      "Files in direct messages are not end-to-end encrypted in this version.\n" +
-      "The server (and admin) can see the file contents.\n\nContinue?")) {
-      e.target.value = ""; return;
-    }
-  }
-  const form = new FormData(); form.append("file", f);
-  try {
-    toast(`Uploading ${f.name}…`, 10000);
-    const res = await fetch("/api/upload", { method: "POST", body: form });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
-    const info = await res.json();
-    sendOp({ op: "file", channel: S.active, file: info });
-    toast(`Uploaded ${f.name}`);
-  } catch (err) {
-    toast("Upload failed: " + err.message, 4000);
-  } finally {
-    e.target.value = "";
-  }
+  await uploadFile(f);
+  e.target.value = "";
 });
 
 // ── Modals ───────────────────────────────────────────────────────────
@@ -1778,11 +2003,6 @@ function openLightbox(src, name, downloadUrl) {
       html: `<svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`,
     }),
     el("img", { src, alt: name, onclick: (e) => e.stopPropagation() }),
-    el("div", { class: "lb-bar", onclick: (e) => e.stopPropagation() }, [
-      el("span", {}, name),
-      el("span", { style: "opacity:.5" }, "·"),
-      el("a", { href: downloadUrl, download: name }, "Download"),
-    ]),
   ]);
   lb.addEventListener("click", closeLightbox);
   document.body.append(lb);
@@ -1900,20 +2120,85 @@ window.addEventListener("blur", () => { if (_emojiOpen) closeEmoji(); });
 
 // ── Paste image / drag-drop ──────────────────────────────────────────
 async function uploadFile(f) {
-  const ch = S.channels.get(S.active);
-  if (ch?.kind === "dm") {
-    if (!confirm(
-      "Files in direct messages are not end-to-end encrypted in this version.\n" +
-      "The server (and admin) can see the file contents.\n\nContinue?")) return;
+  // The atomic /api/upload handler authenticates via the per-WS
+  // session token from the welcome envelope. If we haven't received
+  // it yet (page just loaded, WS still connecting), wait briefly so
+  // the upload doesn't silently land as an orphan with no message.
+  if (!S.session) {
+    toast("Connecting…", 1500);
+    const start = Date.now();
+    while (!S.session && Date.now() - start < 5000) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!S.session) {
+      toast("Not connected — try again in a moment", 4000);
+      return;
+    }
   }
-  const form = new FormData(); form.append("file", f);
+  const ch = S.channels.get(S.active);
+  const peer = ch ? dmPeer(ch) : null;
+  const isDmEncrypted = ch?.kind === "dm" && peer?.pubkey && E2EE.available;
+
+  let blobToUpload = f;
+  let uploadName = f.name;
+  let uploadType = f.type || "application/octet-stream";
+  let envelopeWire = "";
+
+  if (isDmEncrypted) {
+    try {
+      toast(`Encrypting ${f.name}…`, 10000);
+      const buf = await f.arrayBuffer();
+      const { iv, ct } = await E2EE.encryptBytesFor(peer.id, peer.pubkey, buf);
+      // Upload pure ciphertext as opaque bytes. The server (and admin)
+      // sees only "encrypted.bin" of mime application/octet-stream.
+      blobToUpload = new Blob([ct], { type: "application/octet-stream" });
+      uploadName = "encrypted.bin";
+      uploadType = "application/octet-stream";
+      // Wrap real metadata + IV in an envelope and E2EE-encrypt it as
+      // the message text. Receivers parse this to learn how to decrypt
+      // the file body and what it actually is.
+      const env = JSON.stringify({
+        v: 1, kind: "file",
+        iv: b64(iv),
+        name: f.name,
+        mime: f.type || "application/octet-stream",
+        size: f.size,
+      });
+      envelopeWire = await E2EE.encryptFor(peer.id, peer.pubkey, env);
+    } catch (err) {
+      toast("Encrypt failed: " + err.message, 4000);
+      return;
+    }
+  } else if (ch?.kind === "dm") {
+    // DM but no peer pubkey / insecure context — warn before sending in clear.
+    if (!confirm(
+      "Direct-message files normally travel end-to-end encrypted, but the peer's\n" +
+      "encryption key isn't available right now (peer offline or insecure context).\n\n" +
+      "Send this file in plaintext anyway? The server admin will be able to read it.")) {
+      return;
+    }
+  }
+
+  // Atomic upload+post. We package channel, the (encrypted) text
+  // envelope, and a stable client_id alongside the file bytes. The
+  // server saves the file, inserts the message, and broadcasts in
+  // a single request — there is no separate WS announce step that
+  // could be lost on refresh. The client_id makes retries idempotent.
+  const form = new FormData();
+  form.append("file", blobToUpload, uploadName);
+  form.append("channel", S.active);
+  if (envelopeWire) form.append("text", envelopeWire);
+  if (S.session) form.append("session", S.session);
+  const clientId = (crypto.randomUUID && crypto.randomUUID()) ||
+    (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  form.append("client_id", clientId);
   try {
     toast(`Uploading ${f.name}…`, 10000);
     const res = await fetch("/api/upload", { method: "POST", body: form });
     if (!res.ok) throw new Error((await res.text()) || res.statusText);
-    const info = await res.json();
-    sendOp({ op: "file", channel: S.active, file: info });
-    toast(`Uploaded ${f.name}`);
+    // Server already broadcast the message via the channel bus;
+    // our own onWireMsg will render it. Nothing else to do.
+    toast(isDmEncrypted ? `Sent (encrypted) ${f.name}` : `Uploaded ${f.name}`);
   } catch (err) {
     toast("Upload failed: " + err.message, 4000);
   }
@@ -2365,30 +2650,44 @@ function startRingtone() {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
     _ringCtx = new Ctx();
+    // Classic phone ring: two 440+480 Hz dual-tone bursts (~0.4s each
+    // with a short gap), then a long silence — roughly the cadence of
+    // a desk phone but mellower thanks to soft envelopes and a low
+    // master gain. Repeats every 3.2 s.
     const tone = () => {
       const ctx = _ringCtx;
       if (!ctx) return;
       const now = ctx.currentTime;
-      // Two short beeps per ring, like a classic phone bell.
+      const master = ctx.createGain();
+      master.gain.value = 0.22;
+      master.connect(ctx.destination);
+      _ringNodes.push(master);
+
+      // Two bursts per ring.
       for (let i = 0; i < 2; i++) {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = 480 + (i % 2) * 140; // alternating 480/620 Hz
-        const t0 = now + i * 0.45;
-        const t1 = t0 + 0.32;
-        gain.gain.setValueAtTime(0, t0);
-        gain.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
-        gain.gain.setValueAtTime(0.18, t1 - 0.04);
-        gain.gain.linearRampToValueAtTime(0, t1);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(t0);
-        osc.stop(t1 + 0.05);
-        _ringNodes.push(osc, gain);
+        const t0 = now + i * 0.55;
+        const dur = 0.42;
+        const env = ctx.createGain();
+        env.gain.setValueAtTime(0, t0);
+        env.gain.linearRampToValueAtTime(1, t0 + 0.04);
+        env.gain.setValueAtTime(1, t0 + dur - 0.08);
+        env.gain.linearRampToValueAtTime(0, t0 + dur);
+        env.connect(master);
+        _ringNodes.push(env);
+
+        for (const f of [440, 480]) {
+          const osc = ctx.createOscillator();
+          osc.type = "sine";
+          osc.frequency.value = f;
+          osc.connect(env);
+          osc.start(t0);
+          osc.stop(t0 + dur + 0.02);
+          _ringNodes.push(osc);
+        }
       }
     };
     tone();
-    _ringTimer = setInterval(tone, 2500);
+    _ringTimer = setInterval(tone, 3200);
   } catch (e) {
     console.warn("ringtone failed", e);
   }

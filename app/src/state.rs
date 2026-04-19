@@ -1,192 +1,184 @@
 //! Central shared state. Wrapped in `Arc<AppState>` and handed everywhere.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use dashmap::DashMap;
 use compact_str::ToCompactString;
+use dashmap::DashMap;
 
-use crate::channel::ChannelRegistry;
+use crate::channel::{ChannelKind, ChannelRegistry, LOBBY_ID, LOBBY_NAME};
 use crate::config::Config;
+use crate::db::Db;
 use crate::message::ChannelId;
 use crate::metrics::Metrics;
-use crate::persist::{HistoryStore, JsonSnapshot, ReactionLog};
 use crate::user::{UserId, UserInfo};
 
 pub type ReactionKey = (ChannelId, u64);
 pub type EmojiKey = compact_str::CompactString;
 
+/// Live state for an in-progress call. Created when an `offer` is
+/// relayed, mutated when the callee `answer`s, and consumed when an
+/// `end`/`decline`/`busy` arrives — at which point a system message
+/// summarizing the outcome is posted into the DM channel.
+#[derive(Debug, Clone)]
+pub struct CallSession {
+    pub caller_id: UserId,
+    pub caller_name: compact_str::CompactString,
+    pub callee_id: UserId,
+    pub callee_name: compact_str::CompactString,
+    pub video: bool,
+    pub started_at: u64,
+    pub answered_at: Option<u64>,
+}
+
 pub struct AppState {
-    pub app_root: PathBuf,   // OS app-data dir (e.g. %APPDATA%\LocalChat)
+    pub app_root: PathBuf,
     pub uploads_dir: PathBuf,
     pub config_path: PathBuf,
     pub logs_dir: PathBuf,
 
     pub config: RwLock<Config>,
     pub channels: ChannelRegistry,
+
     pub users: DashMap<UserId, UserInfo>,
-    /// Every user that has *ever* connected. Source of truth for the
-    /// persisted users.json. Mirrors `users` for currently-online ones.
     pub known_users: DashMap<UserId, UserInfo>,
-    /// Maps username (lowercased) → user_id so the same person keeps the
-    /// same UserId across reloads AND server restarts. Snapshotted to disk.
     pub username_to_id: DashMap<compact_str::CompactString, UserId>,
-    /// Number of live WebSocket connections per user. >0 means "online".
-    /// Used so a refresh (open new socket before old one dies) doesn't
-    /// flap presence and never strips channel membership.
     pub connections: DashMap<UserId, u32>,
-    pub history: HistoryStore,
+
     pub metrics: Metrics,
 
-    /// Per-message reactions: (channel, msgId) -> emoji -> users that reacted.
-    /// Backed by `reaction_log` (append-only JSONL), replayed on startup.
     pub reactions: DashMap<ReactionKey, DashMap<EmojiKey, Vec<UserId>>>,
-    pub reaction_log: ReactionLog,
 
-    /// Persistent JSON snapshots written atomically.
-    pub users_store: JsonSnapshot,
-    pub channels_store: JsonSnapshot,
+    /// In-flight calls keyed by DM channel id. Pure runtime state —
+    /// not persisted; on restart any in-progress calls are forgotten.
+    pub calls: DashMap<ChannelId, CallSession>,
+
+    pub db: Db,
+
+    /// Per-WS session tokens → user_id. Issued in the WS join op so
+    /// HTTP endpoints (uploads) can identify the user without a
+    /// separate cookie-based auth layer. Tokens live as long as the
+    /// WS connection that created them.
+    pub sessions: DashMap<compact_str::CompactString, UserId>,
 
     pub next_user_id: AtomicU32,
     pub next_msg_id: AtomicU64,
 
-    /// Actual port the server is listening on (set once after bind).
     pub bound_port: AtomicU16,
+
+    pub kick_tx: tokio::sync::broadcast::Sender<KickSignal>,
+
+    /// Set true while a factory/users reset is in progress so that
+    /// the cleanup() path of kicked WS sockets skips writing fresh
+    /// `disconnect` rows (and other per-user persistence) that would
+    /// otherwise survive the DB flush as ghost audit entries.
+    pub resetting: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum KickSignal {
+    All,
+    User(UserId),
 }
 
 impl AppState {
     pub async fn bootstrap() -> std::io::Result<Arc<Self>> {
         let app_root = resolve_app_root();
         let uploads_dir = app_root.join("uploads");
-        let history_dir = app_root.join("history");
         let logs_dir    = app_root.join("logs");
         let config_path = app_root.join("config.json");
 
         let _ = std::fs::create_dir_all(&app_root);
         let _ = std::fs::create_dir_all(&uploads_dir);
-        let _ = std::fs::create_dir_all(&history_dir);
         let _ = std::fs::create_dir_all(&logs_dir);
 
-        // Backward compatibility: migrate old layout (next-to-exe) into
-        // the new app-data folder on first run.
-        migrate_legacy_layout(&app_root, &config_path, &uploads_dir, &history_dir);
-
-        let config = Config::load_or_init(&config_path)?;
+        let mut config = Config::load_or_init(&config_path)?;
         let history_cap = config.history_ram;
-        let rotate_mb = config.rotate_mb;
 
         crate::applog::init(&logs_dir);
-        crate::applog::log(format_args!(
-            "bootstrap: app_root={}",
-            app_root.display()
-        ));
+        crate::applog::log(format_args!("bootstrap: app_root={}", app_root.display()));
 
-        let reaction_log = ReactionLog::new(&app_root);
-        let prior_reactions = reaction_log.load_all().await;
+        let db = Db::open(&app_root)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        crate::applog::log(format_args!("bootstrap: db ready at {}", db.path.display()));
 
-        let users_store = JsonSnapshot::new(app_root.join("users.json"));
-        let channels_store = JsonSnapshot::new(app_root.join("channels.json"));
-
-        // Identity snapshot: { "next_id": u32, "users": [UserInfo...] }.
-        // We only persist enough to reuse the same UserId for the same
-        // username and recall their avatar/color/pubkey on next login.
-        #[derive(serde::Serialize, serde::Deserialize, Default)]
-        struct UsersSnapshot {
-            #[serde(default)]
-            next_id: u32,
-            #[serde(default)]
-            users: Vec<UserInfo>,
-        }
-        let snapshot: UsersSnapshot = users_store.load().await;
-        let prior_channels: Vec<crate::channel::ChannelMeta> =
-            channels_store.load().await;
-
+        let known: Vec<UserInfo> = db.list_users().await.unwrap_or_default();
         let username_to_id: DashMap<compact_str::CompactString, UserId> = DashMap::new();
         let known_users: DashMap<UserId, UserInfo> = DashMap::new();
-        for u in &snapshot.users {
+        for u in &known {
             username_to_id.insert(u.username.to_lowercase().to_compact_string(), u.id);
             known_users.insert(u.id, u.clone());
         }
-        let next_user_id = snapshot.next_id.max(
-            snapshot.users.iter().map(|u| u.id).max().unwrap_or(0) + 1,
-        ).max(1);
+        let next_user_id = db.next_user_id().await.unwrap_or(1).max(1);
 
-        let state = Arc::new(Self {
+        let channels = ChannelRegistry::new(history_cap);
+        let prior_channels = db.list_channels().await.unwrap_or_default();
+        channels.hydrate(prior_channels);
+        if !channels.map.contains_key(LOBBY_ID) {
+            let lobby = crate::channel::Channel::new(
+                compact_str::CompactString::const_new(LOBBY_ID),
+                ChannelKind::Lobby,
+                compact_str::CompactString::const_new(LOBBY_NAME),
+                false,
+                0,
+                channels.history_cap,
+            );
+            channels.map.insert(lobby.id.clone(), Arc::new(lobby));
+        }
+        if let Some(lobby) = channels.get(LOBBY_ID) {
+            let _ = db.upsert_channel(&lobby.meta()).await;
+        }
+
+        let reactions: DashMap<ReactionKey, DashMap<EmojiKey, Vec<UserId>>> = DashMap::new();
+        for r in db.all_reactions().await.unwrap_or_default() {
+            let key = (r.channel_id.clone(), r.message_id);
+            let entry = reactions.entry(key).or_default();
+            entry.entry(r.emoji).or_default().push(r.user_id);
+        }
+
+        let max_msg = db.max_message_id().await.unwrap_or(0);
+        let next_msg = max_msg.saturating_add(1).max(1);
+
+        for entry in channels.map.iter() {
+            let ch = entry.value();
+            let tail = db.tail_messages(&ch.id, channels.history_cap)
+                .await
+                .unwrap_or_default();
+            let mut ring = ch.history.write().await;
+            for m in tail {
+                ring.push_back(Arc::new(m));
+            }
+        }
+
+        if let Ok((users, ips)) = db.list_bans().await {
+            config.banned_users = users;
+            config.banned_ips = ips;
+        }
+
+        Ok(Arc::new(Self {
             app_root,
             uploads_dir,
             config_path,
             logs_dir,
             config: RwLock::new(config),
-            channels: ChannelRegistry::new(history_cap),
+            channels,
             users: DashMap::new(),
             known_users,
             username_to_id,
             connections: DashMap::new(),
-            history: HistoryStore::new(history_dir, rotate_mb),
             metrics: Metrics::default(),
-            reactions: DashMap::new(),
-            reaction_log,
-            users_store,
-            channels_store,
+            reactions,
+            calls: DashMap::new(),
+            db,
+            sessions: DashMap::new(),
             next_user_id: AtomicU32::new(next_user_id),
-            next_msg_id: AtomicU64::new(1),
+            next_msg_id: AtomicU64::new(next_msg),
             bound_port: AtomicU16::new(0),
-        });
-
-        // Hydrate channel metadata (groups + DMs + their member sets).
-        state.channels.hydrate(prior_channels);
-
-        // Replay reaction events into the in-memory map.
-        for ev in prior_reactions {
-            let key = (
-                compact_str::CompactString::from(ev.c.as_str()),
-                ev.m,
-            );
-            let entry = state.reactions.entry(key.clone()).or_default();
-            let mut users = entry.entry(
-                compact_str::CompactString::from(ev.e.as_str()),
-            ).or_default();
-            let pos = users.iter().position(|u| *u == ev.u);
-            if ev.on {
-                if pos.is_none() { users.push(ev.u); }
-            } else if let Some(p) = pos {
-                users.swap_remove(p);
-            }
-            let emoji_empty = users.is_empty();
-            drop(users);
-            if emoji_empty {
-                entry.remove(&compact_str::CompactString::from(ev.e.as_str()));
-            }
-            let entry_empty = entry.is_empty();
-            drop(entry);
-            if entry_empty {
-                state.reactions.remove(&key);
-            }
-        }
-
-        // Warm history for every persistent channel (lobby + groups + DMs).
-        let mut max_id = 0u64;
-        let all_ids: Vec<crate::message::ChannelId> =
-            state.channels.map.iter().map(|e| e.value().id.clone()).collect();
-        for cid in all_ids {
-            if let Some(ch) = state.channels.get(&cid) {
-                let tail = state
-                    .history
-                    .tail(&ch.id, state.channels.history_cap)
-                    .await;
-                let mut ring = ch.history.write().await;
-                for m in tail {
-                    if m.id > max_id { max_id = m.id; }
-                    ring.push_back(m);
-                }
-            }
-        }
-        if max_id > 0 {
-            state.next_msg_id.store(max_id + 1, Ordering::Relaxed);
-        }
-
-        Ok(state)
+            kick_tx: tokio::sync::broadcast::channel(16).0,
+            resetting: AtomicBool::new(false),
+        }))
     }
 
     pub fn next_msg_id(&self) -> u64 {
@@ -197,41 +189,13 @@ impl AppState {
         self.next_user_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Persist the channel registry (groups + DMs + member sets) to disk.
-    /// Cheap (a few hundred bytes per channel) and idempotent.
-    pub async fn save_channels(&self) {
-        let metas = self.channels.snapshot_for_disk();
-        self.channels_store.save(&metas).await;
-    }
-
-    /// Persist the identity table (username → UserId) plus per-user
-    /// avatar/color/pubkey so a returning user keeps the same id and look.
-    pub async fn save_users(&self) {
-        #[derive(serde::Serialize)]
-        struct UsersSnapshot {
-            next_id: u32,
-            users: Vec<UserInfo>,
+    pub async fn save_channel(&self, channel_id: &str) {
+        if let Some(ch) = self.channels.get(channel_id) {
+            let _ = self.db.upsert_channel(&ch.meta()).await;
         }
-        let mut users: Vec<UserInfo> =
-            self.known_users.iter().map(|e| e.value().clone()).collect();
-        users.sort_by_key(|u| u.id);
-        let snap = UsersSnapshot {
-            next_id: self.next_user_id.load(Ordering::Relaxed),
-            users,
-        };
-        self.users_store.save(&snap).await;
     }
 }
 
-/// Where to put writable data.
-///
-/// Order of precedence:
-///   1. `LOCALCHAT_HOME` env var (any dir).
-///   2. OS app-data dir + `"LocalChat"`:
-///        Windows : %APPDATA%\LocalChat
-///        macOS   : ~/Library/Application Support/LocalChat
-///        Linux   : ~/.local/share/LocalChat
-///   3. Fallback: a `localchat-data/` folder next to the exe.
 fn resolve_app_root() -> PathBuf {
     if let Ok(p) = std::env::var("LOCALCHAT_HOME") {
         if !p.is_empty() {
@@ -246,53 +210,4 @@ fn resolve_app_root() -> PathBuf {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     exe_dir.join("localchat-data")
-}
-
-/// One-shot migration from the old layout (config + uploads/ + history/
-/// next to the exe) into the new app-data root. Skipped if the new
-/// config already exists.
-fn migrate_legacy_layout(
-    new_root: &std::path::Path,
-    new_config: &std::path::Path,
-    new_uploads: &std::path::Path,
-    new_history: &std::path::Path,
-) {
-    if new_config.exists() {
-        return;
-    }
-    let exe_dir = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-    {
-        Some(d) => d,
-        None => return,
-    };
-    if exe_dir == new_root {
-        return;
-    }
-    let old_cfg = exe_dir.join("localchat-config.json");
-    if old_cfg.exists() {
-        let _ = std::fs::copy(&old_cfg, new_config);
-    }
-    let old_uploads = exe_dir.join("uploads");
-    if old_uploads.is_dir() {
-        copy_dir_shallow(&old_uploads, new_uploads);
-    }
-    let old_history = exe_dir.join("history");
-    if old_history.is_dir() {
-        copy_dir_shallow(&old_history, new_history);
-    }
-}
-
-fn copy_dir_shallow(src: &std::path::Path, dst: &std::path::Path) {
-    let _ = std::fs::create_dir_all(dst);
-    if let Ok(rd) = std::fs::read_dir(src) {
-        for ent in rd.flatten() {
-            if let Ok(m) = ent.metadata() {
-                if m.is_file() {
-                    let _ = std::fs::copy(ent.path(), dst.join(ent.file_name()));
-                }
-            }
-        }
-    }
 }

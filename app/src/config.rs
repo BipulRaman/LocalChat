@@ -22,9 +22,12 @@ pub struct Config {
     pub rotate_mb: u64,
 
     /// Usernames / IPs that are banned from joining.
-    #[serde(default)]
+    /// Authoritative copy lives in the SQLite `bans` table; this is
+    /// just an in-memory mirror so the WS join check stays sync. Never
+    /// persisted to config.json.
+    #[serde(skip)]
     pub banned_users: Vec<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub banned_ips: Vec<String>,
 
     /// If true, server tries to start on Windows boot (HKCU Run key).

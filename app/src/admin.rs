@@ -18,6 +18,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stats", get(stats))
         .route("/users", get(users))
+        .route("/sessions", get(sessions))
         .route("/channels", get(channels))
         .route("/settings", get(get_settings).post(post_settings))
         .route("/kick/:user_id", post(kick))
@@ -31,6 +32,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/logs", get(logs))
         .route("/restart", post(restart))
         .route("/shutdown", post(shutdown))
+        .route("/reset", post(reset))
+        .route("/reset/users", post(reset_users))
+        .route("/reset/channels", post(reset_channels))
+        .route("/reset/messages", post(reset_messages))
         .route("/open-path", post(open_path))
 }
 
@@ -85,22 +90,75 @@ async fn users(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
-    let list: Vec<_> = state
-        .users
+    // Return *every* user the server has ever seen (not just live ones)
+    // so the admin can audit who has connected, when, and from where.
+    // Online status is derived from the live `users` map.
+    let mut list: Vec<serde_json::Value> = state
+        .known_users
         .iter()
         .map(|e| {
             let u = e.value();
+            let live = state.users.get(&u.id).map(|l| l.value().clone());
+            let online = live.is_some();
+            let sockets = state.connections.get(&u.id).map(|n| *n).unwrap_or(0);
+            let current_ip = live.as_ref().map(|l| l.ip.to_string()).unwrap_or_default();
             json!({
                 "id": u.id,
                 "username": u.username,
-                "ip": u.ip,
-                "joinedAt": u.joined_at,
+                "avatar": u.avatar,
+                "color": u.color,
+                "online": online,
+                "sockets": sockets,
+                "ip": current_ip,                       // current IP (live)
+                "lastIp": u.last_ip,                    // most recent IP (persisted)
+                "joinedAt": u.joined_at,                // first ever join
+                "lastConnect": u.last_connect,          // most recent connect
+                "lastSeen": u.last_seen,                // most recent disconnect (0 if never)
+                "totalSessions": u.total_sessions,
                 "msgCount": u.msg_count,
                 "bytesUploaded": u.bytes_uploaded,
             })
         })
         .collect();
+    // Online users first, then most recently active.
+    list.sort_by(|a, b| {
+        let ao = a.get("online").and_then(|v| v.as_bool()).unwrap_or(false);
+        let bo = b.get("online").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ao != bo { return bo.cmp(&ao); }
+        let at = a.get("lastConnect").and_then(|v| v.as_u64()).unwrap_or(0)
+            .max(a.get("lastSeen").and_then(|v| v.as_u64()).unwrap_or(0));
+        let bt = b.get("lastConnect").and_then(|v| v.as_u64()).unwrap_or(0)
+            .max(b.get("lastSeen").and_then(|v| v.as_u64()).unwrap_or(0));
+        bt.cmp(&at)
+    });
     Ok(Json(json!({"users": list})))
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    limit: Option<usize>,
+    user: Option<u32>,
+}
+
+async fn sessions(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<SessionsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let mut events = state.db.tail_session_events(limit).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(uid) = q.user {
+        events.retain(|e| e.user_id == uid);
+    }
+    // Newest first for display.
+    events.reverse();
+    Ok(Json(json!({
+        "events": events,
+        "path": state.db.path.display().to_string(),
+    })))
 }
 
 async fn channels(
@@ -187,10 +245,22 @@ async fn kick(
     Path(user_id): Path<u32>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
-    // We mark the user as "removed" — the WS loop will notice next round.
-    // Simplest path: remove from users map; subsequent sends fail and
-    // the socket closes. Proper kick would signal via an mpsc per-socket.
     let existed = state.users.remove(&user_id).is_some();
+    // Drop the persisted identity too so /users no longer lists them.
+    state.known_users.remove(&user_id);
+    if let Some(key) = state
+        .username_to_id
+        .iter()
+        .find(|e| *e.value() == user_id)
+        .map(|e| e.key().clone())
+    {
+        state.username_to_id.remove(&key);
+    }
+    state.connections.remove(&user_id);
+    // Actively disconnect every live socket for this user.
+    let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id));
+    let _ = state.db.delete_user(user_id).await;
+    let _ = state.db.log_admin("kick", &addr.ip().to_string(), &user_id.to_string(), "").await;
     Ok(Json(json!({"ok": existed})))
 }
 
@@ -205,16 +275,24 @@ async fn ban(
     let Some((username, ip)) = to_ban else {
         return Err((StatusCode::NOT_FOUND, "no such user".into()));
     };
-    let mut cfg = state.config.write().unwrap();
-    if !cfg.banned_users.contains(&username) {
-        cfg.banned_users.push(username.clone());
+    {
+        let mut cfg = state.config.write().unwrap();
+        if !cfg.banned_users.contains(&username) {
+            cfg.banned_users.push(username.clone());
+        }
+        if !cfg.banned_ips.contains(&ip) && !ip.is_empty() {
+            cfg.banned_ips.push(ip.clone());
+        }
     }
-    if !cfg.banned_ips.contains(&ip) && !ip.is_empty() {
-        cfg.banned_ips.push(ip);
+    let now = crate::message::now_secs();
+    let _ = state.db.add_ban("user", &username, "admin ban", now).await;
+    if !ip.is_empty() {
+        let _ = state.db.add_ban("ip", &ip, "admin ban", now).await;
     }
-    let _ = cfg.save(&state.config_path);
-    drop(cfg);
+    let _ = state.db.log_admin("ban", &addr.ip().to_string(), &user_id.to_string(), &username).await;
     state.users.remove(&user_id);
+    // Actively boot the banned user's open sockets.
+    let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id));
     Ok(Json(json!({"ok": true})))
 }
 
@@ -225,10 +303,12 @@ async fn unban(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
-    let mut cfg = state.config.write().unwrap();
-    cfg.banned_users.retain(|u| u != &username);
-    cfg.save(&state.config_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.banned_users.retain(|u| u != &username);
+    }
+    let _ = state.db.remove_ban("user", &username).await;
+    let _ = state.db.log_admin("unban", &addr.ip().to_string(), &username, "").await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -267,8 +347,9 @@ async fn broadcast(
         deleted: false,
     });
     ch.push_history(msg.clone()).await;
-    state.history.append(&msg).await;
+    let _ = state.db.insert_message(&msg).await;
     let _ = ch.tx.send(msg);
+    let _ = state.db.log_admin("broadcast", &addr.ip().to_string(), &ch_id, &req.text).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -309,8 +390,9 @@ async fn delete_channel(
         }));
     }
     state.channels.delete_any(&id);
-    state.history.delete_channel(&id).await;
+    let _ = state.db.delete_channel(&id).await;
     state.reactions.retain(|(c, _), _| c != &cid);
+    let _ = state.db.log_admin("delete_channel", &addr.ip().to_string(), &id, "").await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -320,26 +402,38 @@ async fn list_uploads(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
-    let mut out = Vec::new();
+    // Index lives in the DB; the bytes live on disk. We list from the DB
+    // so we get original filename, mime, uploader, etc. — then enrich
+    // with the on-disk size/mtime for any orphans not in the index.
+    let mut rows = state.db.list_uploads().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut indexed: std::collections::HashSet<String> = rows.iter()
+        .map(|r| r.storage_name.clone()).collect();
     if let Ok(mut rd) = tokio::fs::read_dir(&state.uploads_dir).await {
         while let Ok(Some(ent)) = rd.next_entry().await {
             if let Ok(m) = ent.metadata().await {
-                if m.is_file() {
+                if !m.is_file() { continue; }
+                let name = ent.file_name().to_string_lossy().to_string();
+                if indexed.insert(name.clone()) {
                     let modified = m.modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    out.push(json!({
-                        "name": ent.file_name().to_string_lossy(),
-                        "size": m.len(),
-                        "modified": modified,
-                    }));
+                    rows.push(crate::db::UploadRow {
+                        storage_name: name.clone(),
+                        original_name: name,
+                        mime: String::new(),
+                        size: m.len(),
+                        uploaded_by: None,
+                        uploaded_by_name: String::new(),
+                        uploaded_at: modified,
+                    });
                 }
             }
         }
     }
-    Ok(Json(json!({"files": out})))
+    Ok(Json(json!({"files": rows})))
 }
 
 async fn delete_upload(
@@ -357,6 +451,8 @@ async fn delete_upload(
     tokio::fs::remove_file(path)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let _ = state.db.delete_upload(safe).await;
+    let _ = state.db.log_admin("delete_upload", &addr.ip().to_string(), safe, "").await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -504,6 +600,288 @@ async fn shutdown(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
     spawn_self_and_exit(true);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Master "factory reset": wipes every user, channel, message, reaction,
+/// upload, and session-audit record from both memory and disk. The lobby
+/// is recreated empty. Active WebSockets are notified and will fail their
+/// next op (their user/channel is gone), causing the clients to reconnect
+/// fresh. Configuration (port, banned lists, etc.) is preserved.
+#[derive(Deserialize, Default)]
+struct ResetReq {
+    /// Must be the literal string "RESET" to proceed. Cheap server-side
+    /// guard against accidental POSTs from confused tooling.
+    #[serde(default)]
+    confirm: String,
+}
+
+async fn reset(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ResetReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    if req.confirm != "RESET" {
+        return Err((StatusCode::BAD_REQUEST, "missing confirm=\"RESET\"".into()));
+    }
+
+    use crate::channel::{Channel, ChannelKind, LOBBY_ID, LOBBY_NAME};
+    use crate::message::{now_secs, MsgKind, WireMsg};
+    use compact_str::CompactString;
+    use std::sync::atomic::Ordering;
+
+    crate::applog::log(format_args!(
+        "admin: factory reset triggered from {}", addr.ip()
+    ));
+
+    // Engage the reset guard so any in-flight WS cleanup() paths skip
+    // their per-user audit/identity writes (which would otherwise race
+    // the DB flush below and leave ghost rows behind).
+    state.resetting.store(true, Ordering::Relaxed);
+
+    // 1. Best-effort notice to anyone currently connected.
+    if let Some(lobby) = state.channels.get(LOBBY_ID) {
+        let _ = lobby.tx.send(Arc::new(WireMsg {
+            id: 0,
+            channel: lobby.id.clone(),
+            kind: MsgKind::System,
+            user_id: 0,
+            username: CompactString::const_new("admin"),
+            avatar: CompactString::const_new(""),
+            color: CompactString::const_new("#ef4444"),
+            ts: now_secs(),
+            text: "⚠️ Server data was wiped by the administrator. Please refresh.".to_string(),
+            file: None,
+            reply_to: None,
+            edited_at: None,
+            deleted: false,
+        }));
+    }
+
+    // 2. Wipe in-memory state.
+    state.users.clear();
+    state.known_users.clear();
+    state.username_to_id.clear();
+    state.connections.clear();
+    state.reactions.clear();
+    state.channels.map.clear();
+    state.channels.user_channels.clear();
+    state.calls.clear();
+
+    // 3. Recreate the lobby (in-memory) so the next user to join has
+    //    something to land on, and reset id counters.
+    let lobby = Channel::new(
+        CompactString::const_new(LOBBY_ID),
+        ChannelKind::Lobby,
+        CompactString::const_new(LOBBY_NAME),
+        false,
+        0,
+        state.channels.history_cap,
+    );
+    state.channels.map.insert(lobby.id.clone(), Arc::new(lobby));
+    state.next_user_id.store(1, Ordering::Relaxed);
+    state.next_msg_id.store(1, Ordering::Relaxed);
+
+    // 4. Force every live socket to close so clients reconnect against
+    //    the freshly-empty server. The cleanup() path is gated by
+    //    `state.resetting`, so no fresh `disconnect` rows are written.
+    let _ = state.kick_tx.send(crate::state::KickSignal::All);
+    // Give cleanup tasks a tick to run before we flush.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 5. Wipe all SQLite-backed state in one transaction. Bans and the
+    //    admin-event audit are preserved on purpose.
+    let flush_result = state.db.flush_all().await;
+    // Re-insert the lobby so the next user to join doesn't trip an FK
+    // violation when posting their first message.
+    if let Some(lobby) = state.channels.get(LOBBY_ID) {
+        let _ = state.db.upsert_channel(&lobby.meta()).await;
+    }
+
+    // Release the reset guard so future disconnects audit normally.
+    state.resetting.store(false, Ordering::Relaxed);
+
+    flush_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 6. Wipe upload bytes too. The DB index has already been cleared
+    //    above by flush_all().
+    wipe_dir_files(&state.uploads_dir).await;
+    let _ = state.db.log_admin("reset_all", &addr.ip().to_string(), "", "").await;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Delete every regular file directly inside `dir`. Subdirectories are
+/// left alone (none of our data dirs use them today).
+async fn wipe_dir_files(dir: &std::path::Path) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return };
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        if let Ok(m) = ent.metadata().await {
+            if m.is_file() {
+                let _ = tokio::fs::remove_file(ent.path()).await;
+            }
+        }
+    }
+}
+
+// ── Granular reset endpoints ────────────────────────────────────────
+//
+// Each one wipes a single category. They share the "confirm=RESET" gate
+// of the master reset so accidental POSTs can't take effect. Settings
+// (port, banned lists, autostart) are always preserved.
+
+/// Wipe every known user (live and historical), channel-membership
+/// entries, and the session audit log. Channels themselves are kept,
+/// but their member lists are cleared. Active sockets are forced off
+/// because the next op they send will fail (their user is gone).
+async fn reset_users(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ResetReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    if req.confirm != "RESET" {
+        return Err((StatusCode::BAD_REQUEST, "missing confirm=\"RESET\"".into()));
+    }
+    use std::sync::atomic::Ordering;
+    crate::applog::log(format_args!(
+        "admin: reset users triggered from {}", addr.ip()
+    ));
+
+    state.resetting.store(true, Ordering::Relaxed);
+
+    state.users.clear();
+    state.known_users.clear();
+    state.username_to_id.clear();
+    state.connections.clear();
+
+    // Strip every channel's member list so orphan UserIds don't linger.
+    for entry in state.channels.map.iter() {
+        entry.value().members.clear();
+    }
+    state.channels.user_channels.clear();
+
+    state.next_user_id.store(1, Ordering::Relaxed);
+
+    // Boot every live socket first so users get logged out immediately.
+    // The cleanup() path is gated by `state.resetting`, so no fresh
+    // disconnect rows are written into session_events.
+    let _ = state.kick_tx.send(crate::state::KickSignal::All);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Wipe users + cascade memberships, plus the session audit log.
+    let flush_result = state.db.flush_users().await;
+    let _ = state.db.flush_session_events().await;
+    let _ = state.db.log_admin("reset_users", &addr.ip().to_string(), "", "").await;
+
+    state.resetting.store(false, Ordering::Relaxed);
+
+    flush_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Wipe every channel except the lobby, plus all message history and
+/// reactions. Users are kept (their identity, IDs, avatar/color, and
+/// session history all survive).
+async fn reset_channels(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ResetReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    if req.confirm != "RESET" {
+        return Err((StatusCode::BAD_REQUEST, "missing confirm=\"RESET\"".into()));
+    }
+    use crate::channel::{Channel, ChannelKind, LOBBY_ID, LOBBY_NAME};
+    use compact_str::CompactString;
+    crate::applog::log(format_args!(
+        "admin: reset channels triggered from {}", addr.ip()
+    ));
+
+    // Notify before tear-down so live clients drop their channel UI.
+    if let Some(lobby) = state.channels.get(LOBBY_ID) {
+        use crate::message::{now_secs, MsgKind, WireMsg};
+        let _ = lobby.tx.send(Arc::new(WireMsg {
+            id: 0,
+            channel: lobby.id.clone(),
+            kind: MsgKind::System,
+            user_id: 0,
+            username: CompactString::const_new("admin"),
+            avatar: CompactString::const_new(""),
+            color: CompactString::const_new("#ef4444"),
+            ts: now_secs(),
+            text: "⚠️ All channels were cleared by the administrator. Please refresh.".to_string(),
+            file: None,
+            reply_to: None,
+            edited_at: None,
+            deleted: false,
+        }));
+    }
+
+    state.channels.map.clear();
+    state.channels.user_channels.clear();
+    state.reactions.clear();
+
+    // Boot live sockets so clients reconnect against the fresh lobby.
+    let _ = state.kick_tx.send(crate::state::KickSignal::All);
+
+    // Recreate a fresh, empty lobby.
+    let lobby = Channel::new(
+        CompactString::const_new(LOBBY_ID),
+        ChannelKind::Lobby,
+        CompactString::const_new(LOBBY_NAME),
+        false,
+        0,
+        state.channels.history_cap,
+    );
+    state.channels.map.insert(lobby.id.clone(), Arc::new(lobby));
+
+    let _ = state.channels.get(LOBBY_ID).map(|l| l.id.clone());
+    state.db.flush_channels().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(lobby) = state.channels.get(LOBBY_ID) {
+        let _ = state.db.upsert_channel(&lobby.meta()).await;
+    }
+    let _ = state.db.log_admin("reset_channels", &addr.ip().to_string(), "", "").await;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Wipe message history and reactions for every channel, but keep the
+/// channels themselves (and their members). Useful for clearing chatter
+/// without losing the chat structure.
+async fn reset_messages(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ResetReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    if req.confirm != "RESET" {
+        return Err((StatusCode::BAD_REQUEST, "missing confirm=\"RESET\"".into()));
+    }
+    use std::sync::atomic::Ordering;
+    crate::applog::log(format_args!(
+        "admin: reset messages triggered from {}", addr.ip()
+    ));
+
+    // Drain every channel's in-memory history ring.
+    for entry in state.channels.map.iter() {
+        let mut h = entry.value().history.write().await;
+        h.clear();
+    }
+    state.reactions.clear();
+    state.next_msg_id.store(1, Ordering::Relaxed);
+
+    state.db.flush_messages().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.db.log_admin("reset_messages", &addr.ip().to_string(), "", "").await;
+
     Ok(Json(json!({ "ok": true })))
 }
 

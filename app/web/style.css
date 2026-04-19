@@ -115,7 +115,7 @@ body {
   overflow: hidden;
 }
 button, input, textarea, select { font: inherit; color: inherit; }
-button { border: 0; background: transparent; cursor: pointer; }
+button { border: 0; background: transparent; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 a { color: var(--brand); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
@@ -258,9 +258,6 @@ input:focus, textarea:focus {
   grid-template-columns: var(--sidebar-w) 1fr;
   height: 100vh;
   height: 100dvh;
-  /* Mobile keyboard: visualViewport-driven height (set by app.js).
-     Falls back to dvh / vh on browsers without visualViewport. */
-  height: var(--vv-h, 100dvh);
   background: var(--bg-0);
   /* prevent body scroll when textarea grows / keyboard opens */
   overflow: hidden;
@@ -580,7 +577,6 @@ input:focus, textarea:focus {
   min-width: 0;
   height: 100vh;
   height: 100dvh;
-  height: var(--vv-h, 100dvh);
   background: var(--bg-0);
   min-height: 0;
 }
@@ -725,30 +721,45 @@ input:focus, textarea:focus {
   font-size: 14.2px;
   line-height: 1.4;
   word-wrap: break-word;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 [data-theme="light"] .bubble { color: #111b21; }
 
-/* Bubbles that contain an image: cap at media width, tighten padding. */
-.bubble:has(.image-att) {
+/* Bubbles that contain an image or video: cap at media width, tighten padding. */
+.bubble:has(.image-att),
+.bubble:has(.video-att) {
   width: 360px;
   max-width: 78%;
   padding: 4px;
   /* overflow visible so reaction chips & hover actions can sit outside */
 }
+/* Video bubbles get a bit more breathing room — video benefits from
+   a larger frame than a still image. */
+.bubble:has(.video-att) {
+  width: 480px;
+  max-width: 90%;
+}
 /* Author row above image (legacy — header sits outside bubble now) */
 .bubble:has(.image-att) > .author-row,
-.bubble:has(.image-att) > .author { display: none; }
-/* Caption sits below image with comfortable padding */
-.bubble:has(.image-att) > .text {
+.bubble:has(.image-att) > .author,
+.bubble:has(.video-att) > .author-row,
+.bubble:has(.video-att) > .author { display: none; }
+/* Caption sits below media with comfortable padding */
+.bubble:has(.image-att) > .text,
+.bubble:has(.video-att) > .text {
   padding: 6px 8px 4px 8px;
   padding-right: 8px;
 }
-.msg.own .bubble:has(.image-att) > .text { padding-right: 32px; }
-.bubble:has(.image-att) > .meta { right: 10px; bottom: 8px; }
+.msg.own .bubble:has(.image-att) > .text,
+.msg.own .bubble:has(.video-att) > .text { padding-right: 32px; }
+.bubble:has(.image-att) > .meta,
+.bubble:has(.video-att) > .meta { right: 10px; bottom: 8px; }
 
-/* No caption: ticks (own) overlay the image as a compact pill at bottom-right */
-.bubble:has(.image-att):not(:has(> .text)) > .meta {
+/* No caption: ticks (own) overlay the media as a compact pill at bottom-right */
+.bubble:has(.image-att):not(:has(> .text)) > .meta,
+.bubble:has(.video-att):not(:has(> .text)) > .meta {
   position: absolute;
   right: 8px;
   bottom: 8px;
@@ -760,8 +771,10 @@ input:focus, textarea:focus {
   color: #fff !important;
   text-shadow: 0 1px 1px rgba(0,0,0,0.4);
 }
-.bubble:has(.image-att):not(:has(> .text)) > .meta .ticks { color: #fff; }
-.bubble:has(.image-att):not(:has(> .text)) > .meta .ticks.read { color: #88e6ff; }
+.bubble:has(.image-att):not(:has(> .text)) > .meta .ticks,
+.bubble:has(.video-att):not(:has(> .text)) > .meta .ticks { color: #fff; }
+.bubble:has(.image-att):not(:has(> .text)) > .meta .ticks.read,
+.bubble:has(.video-att):not(:has(> .text)) > .meta .ticks.read { color: #88e6ff; }
 
 .msg.own .bubble {
   background: var(--wa-own);
@@ -798,6 +811,12 @@ input:focus, textarea:focus {
   white-space: pre-wrap;
   /* Reserve a small right pad for own-msg ticks (no time inside bubble anymore). */
   padding-right: 0;
+  /* Long unbroken tokens (URLs, base64 blobs, hashes) must wrap inside the
+     bubble instead of pushing it past its max-width. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
 }
 .msg.own .bubble .text { padding-right: 28px; }
 .bubble .text.jumbo {
@@ -908,6 +927,39 @@ input:focus, textarea:focus {
 .bubble .image-att .img-meta {
   display: none;
 }
+
+/* Inline video / audio attachments — same look-and-feel as images. */
+.bubble .video-att {
+  position: relative;
+  display: block;
+  margin: 0;
+  width: 100%;
+  border-radius: 7px;
+  overflow: hidden;
+  background: #000;
+}
+.bubble .video-att video {
+  display: block;
+  width: 100%;
+  max-height: 520px;
+  height: auto;
+  background: #000;
+  outline: none;
+}
+.bubble .video-att .img-meta { display: none; }
+
+.bubble .audio-att {
+  display: block;
+  margin: 0;
+  width: 100%;
+}
+.bubble .audio-att audio {
+  display: block;
+  width: 100%;
+  min-width: 240px;
+  max-width: 360px;
+}
+.bubble .audio-att .img-meta { display: none; }
 
 /* ─── Lightbox ──────────────────────────────────────────────── */
 .lightbox {
@@ -1179,6 +1231,8 @@ input:focus, textarea:focus {
   background: var(--brand); color: white;
   border-radius: 50%;
   transition: background var(--transition), transform var(--transition);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
 }
 .send-btn:hover { background: var(--brand-hover); }
 .send-btn:active { transform: scale(0.95); }

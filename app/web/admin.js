@@ -69,6 +69,7 @@ const S = {
   logs: { auto: false, follow: true, filter: "", level: "all", lines: 200, errors: 0 },
   upload: { sort: "date", filter: "", selected: new Set() },
   user: { onlineOnly: false, filter: "" },
+  sessions: { events: [], path: null, userFilter: null, eventFilter: "all", textFilter: "", limit: 500, loading: false },
   settingsTab: "general",
   pollTimer: null,
   logsTimer: null,
@@ -186,6 +187,10 @@ function renderTopbar() {
 
 function renderRail() {
   $("navUsers").textContent     = S.data.users.length || "";
+  if ($("navSessions")) {
+    const online = S.data.users.filter((u) => u.online).length;
+    $("navSessions").textContent = online ? online + " on" : "";
+  }
   $("navChannels").textContent  = S.data.channels.length || "";
   $("navUploads").textContent   = S.data.uploads.length || "";
   $("navLogs").textContent      = S.logs.errors || "";
@@ -213,6 +218,7 @@ function renderRoute() {
 const sections = {
   overview:  renderOverview,
   users:     renderUsersSection,
+  sessions:  renderSessionsSection,
   channels:  renderChannelsSection,
   uploads:   renderUploadsSection,
   logs:      renderLogsSection,
@@ -313,7 +319,12 @@ function statTile(label, value, sub, route, onclick, pct) {
 // ── Users ───────────────────────────────────────────────────────────
 function renderUsersSection() {
   const root = el("section", { class: "ad-section" });
-  root.append(sectionHeader(`Users (${S.data.users.length})`, "Manage live sessions."));
+  const total = S.data.users.length;
+  const online = S.data.users.filter((u) => u.online).length;
+  root.append(sectionHeader(
+    `Users (${online} online · ${total} total)`,
+    "Every user that has ever connected. Click History for the full session log."
+  ));
 
   const toolbar = el("div", { class: "ad-toolbar" }, [
     el("input", {
@@ -341,7 +352,8 @@ function paintUsers(host) {
   if (!host) return;
   const q = S.user.filter;
   let list = S.data.users;
-  if (q) list = list.filter((u) => (u.username || "").toLowerCase().includes(q) || (u.ip || "").toLowerCase().includes(q));
+  if (S.user.onlineOnly) list = list.filter((u) => u.online);
+  if (q) list = list.filter((u) => (u.username || "").toLowerCase().includes(q) || (u.ip || u.lastIp || "").toLowerCase().includes(q));
   if (!list.length) {
     host.replaceChildren(emptyState("No users", q ? "Nothing matches your filter." : "Nobody is connected right now."));
     return;
@@ -351,30 +363,50 @@ function paintUsers(host) {
 
 function userRow(u) {
   const initial = (u.username?.[0] || "?").toUpperCase();
-  return el("div", { class: "ad-row ad-user-row" }, [
-    el("div", { class: "ad-avatar", style: `background:${colorForName(u.username || "")}`, title: u.username }, initial),
+  const online = !!u.online;
+  const sub = [];
+  const ip = u.ip || u.lastIp;
+  if (ip) sub.push(el("span", null, ip));
+  if (sub.length) sub.push(el("span", { class: "ad-sep" }, "·"));
+  if (online) {
+    sub.push(el("span", { title: fmtTime(u.lastConnect) },
+      "online since " + fmtRel(u.lastConnect) +
+      (u.sockets > 1 ? ` (${u.sockets} sockets)` : "")));
+  } else if (u.lastSeen) {
+    sub.push(el("span", { title: fmtTime(u.lastSeen) }, "last seen " + fmtRel(u.lastSeen)));
+  } else {
+    sub.push(el("span", { title: fmtTime(u.joinedAt) }, "joined " + fmtRel(u.joinedAt)));
+  }
+  sub.push(el("span", { class: "ad-sep" }, "·"));
+  sub.push(el("span", null, (u.totalSessions || 0) + " sessions"));
+  sub.push(el("span", { class: "ad-sep" }, "·"));
+  sub.push(el("span", null, (u.msgCount || 0) + " msgs"));
+
+  return el("div", { class: "ad-row ad-user-row" + (online ? " online" : " offline") }, [
+    el("div", { class: "ad-avatar", style: `background:${u.color || colorForName(u.username || "")}`, title: u.username }, [
+      document.createTextNode(initial),
+      el("span", { class: "ad-presence-dot " + (online ? "on" : "off"),
+                   title: online ? "Online" : "Offline" }),
+    ]),
     el("div", { class: "ad-row-meta" }, [
       el("div", { class: "ad-row-title" }, [
         document.createTextNode(u.username || "—"),
         el("span", { class: "ad-tag", title: "User ID" }, "#" + u.id),
+        el("span", { class: "ad-tag ad-tag-" + (online ? "ok" : "info") }, online ? "online" : "offline"),
       ]),
-      el("div", { class: "ad-row-sub muted xs" }, [
-        u.ip ? el("span", null, u.ip) : null,
-        u.ip ? el("span", { class: "ad-sep" }, "·") : null,
-        el("span", { title: fmtTime(u.joinedAt) }, "joined " + fmtRel(u.joinedAt)),
-        el("span", { class: "ad-sep" }, "·"),
-        el("span", null, (u.msgCount || 0) + " msgs"),
-      ]),
+      el("div", { class: "ad-row-sub muted xs" }, sub),
     ]),
     el("div", { class: "ad-row-actions" }, [
-      el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: async () => {
+      el("button", { class: "btn btn-ghost btn-sm", type: "button",
+        onclick: () => { S.sessions.userFilter = u.id; setRoute("sessions"); } }, "History"),
+      online ? el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: async () => {
         try { await api(`/kick/${u.id}`, { method: "POST" }); toast("Kicked " + u.username); refreshAll(); }
         catch (err) { toast("Error: " + err.message); }
-      } }, "Kick"),
+      } }, "Kick") : null,
       el("button", { class: "btn btn-danger btn-sm", type: "button", onclick: async () => {
         const ok = await confirmDialog({
           title: "Ban user?",
-          body: `Ban ${u.username} (${u.ip || "no IP"})?\n\nThis adds them to banned-users and banned-IPs and disconnects them. You can unban from Settings → Access.`,
+          body: `Ban ${u.username} (${ip || "no IP"})?\n\nThis adds them to banned-users and banned-IPs and disconnects them. You can unban from Settings → Access.`,
           okText: "Ban", okClass: "btn-danger",
         });
         if (!ok) return;
@@ -383,6 +415,142 @@ function userRow(u) {
       } }, "Ban"),
     ]),
   ]);
+}
+
+// ── Sessions (audit log) ────────────────────────────────────────────
+function renderSessionsSection() {
+  const root = el("section", { class: "ad-section" });
+  root.append(sectionHeader(
+    "Session history",
+    "Append-only audit of every WebSocket connect and disconnect, with IP and duration. Persists across server restarts."
+  ));
+
+  const focusedUser = S.sessions.userFilter
+    ? S.data.users.find((u) => u.id === S.sessions.userFilter)
+    : null;
+
+  const toolbar = el("div", { class: "ad-toolbar" }, [
+    el("input", {
+      type: "search", placeholder: "Filter username or IP…", class: "ad-search",
+      value: S.sessions.textFilter,
+      oninput: (e) => { S.sessions.textFilter = e.target.value.toLowerCase(); paintSessions(); },
+    }),
+    el("label", { class: "ad-toolbar-label muted sm" }, "Event"),
+    el("select", { class: "ad-select", onchange: (e) => { S.sessions.eventFilter = e.target.value; paintSessions(); } }, [
+      ["all", "All"], ["connect", "Connected"], ["disconnect", "Disconnected"],
+    ].map(([v, l]) => el("option", { value: v, selected: S.sessions.eventFilter === v }, l))),
+    el("label", { class: "ad-toolbar-label muted sm" }, "Show"),
+    el("select", { class: "ad-select", onchange: (e) => { S.sessions.limit = parseInt(e.target.value, 10) || 500; loadSessions(); } }, [
+      [200, "Last 200"], [500, "Last 500"], [2000, "Last 2 000"], [5000, "Last 5 000"],
+    ].map(([v, l]) => el("option", { value: v, selected: S.sessions.limit === v }, l))),
+    focusedUser
+      ? el("span", { class: "ad-pill warn", title: "Filtered to one user" }, [
+          document.createTextNode(`only ${focusedUser.username} `),
+          el("button", { class: "btn btn-ghost btn-sm", type: "button",
+            onclick: () => { S.sessions.userFilter = null; paintSessions(); } }, "clear"),
+        ])
+      : null,
+    el("span", { class: "ad-toolbar-sp" }),
+    el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: loadSessions }, "Refresh"),
+    el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: downloadSessions }, "Download CSV"),
+  ]);
+  root.append(toolbar);
+
+  const list = el("div", { class: "ad-session-list", id: "adSessionList" }, [
+    el("p", { class: "muted sm" }, "Loading…"),
+  ]);
+  root.append(list);
+
+  const meta = el("p", { class: "muted xs", id: "adSessionMeta" }, "—");
+  root.append(meta);
+
+  loadSessions();
+  return root;
+}
+
+async function loadSessions() {
+  const host = $("adSessionList");
+  if (host) host.replaceChildren(el("p", { class: "muted sm" }, "Loading…"));
+  S.sessions.loading = true;
+  try {
+    const r = await api(`/sessions?limit=${S.sessions.limit}`);
+    S.sessions.events = r.events || [];
+    S.sessions.path = r.path || null;
+    paintSessions();
+  } catch (err) {
+    if (host) host.replaceChildren(emptyState("Could not load sessions", err.message));
+  } finally {
+    S.sessions.loading = false;
+  }
+}
+
+function paintSessions() {
+  const host = $("adSessionList");
+  const meta = $("adSessionMeta");
+  if (!host) return;
+  let list = S.sessions.events.slice();
+  if (S.sessions.userFilter) list = list.filter((e) => e.userId === S.sessions.userFilter);
+  if (S.sessions.eventFilter !== "all") list = list.filter((e) => e.event === S.sessions.eventFilter);
+  const q = S.sessions.textFilter;
+  if (q) list = list.filter((e) =>
+    (e.username || "").toLowerCase().includes(q) || (e.ip || "").toLowerCase().includes(q));
+
+  if (!list.length) {
+    host.replaceChildren(emptyState("No matching events", "Try widening the filters or refreshing."));
+  } else {
+    host.replaceChildren(...list.map(sessionRow));
+  }
+  if (meta) {
+    meta.textContent = `${list.length} of ${S.sessions.events.length} events` +
+      (S.sessions.path ? ` · ${S.sessions.path}` : "");
+  }
+}
+
+function sessionRow(e) {
+  const isConnect = e.event === "connect";
+  const label = isConnect ? "Connected" : "Disconnected";
+  return el("div", { class: "ad-row ad-session-row" }, [
+    el("div", { class: "ad-session-icon " + (isConnect ? "on" : "off"),
+                title: label }, isConnect ? "▲" : "▼"),
+    el("div", { class: "ad-row-meta" }, [
+      el("div", { class: "ad-row-title" }, [
+        document.createTextNode(e.username || "(unknown)"),
+        el("span", { class: "ad-tag" }, "#" + e.userId),
+        el("span", { class: "ad-tag ad-tag-" + (isConnect ? "ok" : "info") }, label),
+        e.duration != null
+          ? el("span", { class: "ad-tag" }, "duration " + fmtDur(e.duration))
+          : null,
+        e.sockets != null
+          ? el("span", { class: "ad-tag" }, e.sockets + " socket" + (e.sockets === 1 ? "" : "s"))
+          : null,
+      ]),
+      el("div", { class: "ad-row-sub muted xs" }, [
+        el("span", { class: "ad-mono" }, e.ip || "—"),
+        el("span", { class: "ad-sep" }, "·"),
+        el("span", { title: fmtTime(e.ts) }, fmtRel(e.ts)),
+      ]),
+    ]),
+  ]);
+}
+
+function downloadSessions() {
+  const rows = [["timestamp_iso", "timestamp_unix", "event", "user_id", "username", "ip", "duration_s", "sockets"]];
+  for (const e of S.sessions.events) {
+    rows.push([
+      new Date((e.ts || 0) * 1000).toISOString(),
+      e.ts || 0, e.event || "", e.userId || 0, e.username || "", e.ip || "",
+      e.duration ?? "", e.sockets ?? "",
+    ]);
+  }
+  const csv = rows.map((r) => r.map((c) => {
+    const s = String(c);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `localchat-sessions-${Date.now()}.csv`; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ── Channels ────────────────────────────────────────────────────────
@@ -512,21 +680,22 @@ function renderUploadsSection() {
 function paintUploads(host) {
   host = host || $("adUploadGrid");
   if (!host) return;
+  const bulkBtn = $("adUpBulk");
   let list = S.data.uploads.slice();
   const q = S.upload.filter;
   if (q) list = list.filter((f) => (f.name || "").toLowerCase().includes(q));
   switch (S.upload.sort) {
     case "size": list.sort((a, b) => (b.size || 0) - (a.size || 0)); break;
     case "name": list.sort((a, b) => (a.name || "").localeCompare(b.name || "")); break;
-    default:     list.sort((a, b) => (b.modified || 0) - (a.modified || 0)); break;
+    default:     list.sort((a, b) => (b.uploadedAt || 0) - (a.uploadedAt || 0)); break;
   }
   if (!list.length) {
     host.replaceChildren(emptyState("No uploads", q ? "Nothing matches your filter." : "No files have been uploaded yet."));
-    $("adUpBulk").disabled = true;
+    if (bulkBtn) bulkBtn.disabled = true;
     return;
   }
   host.replaceChildren(...list.map(uploadCard));
-  $("adUpBulk").disabled = !S.upload.selected.size;
+  if (bulkBtn) bulkBtn.disabled = !S.upload.selected.size;
 }
 
 function uploadCard(f) {
@@ -547,8 +716,8 @@ function uploadCard(f) {
     el("a", { class: "ad-up-thumb", href: url, target: "_blank", rel: "noopener" },
       isImage ? [el("img", { src: url, alt: f.name, loading: "lazy" })] : [el("div", { class: "ad-up-ext" }, ext.slice(0, 4) || "file")]),
     el("div", { class: "ad-up-meta" }, [
-      el("div", { class: "ad-up-name", title: f.name }, f.name),
-      el("div", { class: "muted xs" }, `${fmtSize(f.size)}${f.modified ? " · " + fmtRel(f.modified) : ""}`),
+      el("div", { class: "ad-up-name", title: f.originalName || f.name }, f.originalName || f.name),
+      el("div", { class: "muted xs" }, `${fmtSize(f.size)}${f.uploadedAt ? " · " + fmtRel(f.uploadedAt) : ""}${f.uploadedByName ? " · " + f.uploadedByName : ""}`),
     ]),
     el("div", { class: "ad-up-actions" }, [
       el("button", {
@@ -995,6 +1164,40 @@ function renderSettingsDanger() {
       ]),
       el("button", { class: "btn btn-danger", type: "button", onclick: shutdownServer }, "Shut down…"),
     ]),
+    el("div", { class: "ad-danger-row" }, [
+      el("div", null, [
+        el("div", { class: "ad-danger-title" }, "Flush all users"),
+        el("div", { class: "muted sm" }, "Removes every user record (live and historical) and the session audit log. Channels survive but their member lists are cleared. Active users are disconnected."),
+      ]),
+      el("button", { class: "btn btn-danger", type: "button",
+        onclick: () => flushCategory("users", "/reset/users", "Flush all users?",
+          "Deletes every user account, identity record, and session audit entry. Channels, settings, banned lists, and uploads are kept.") }, "Flush users…"),
+    ]),
+    el("div", { class: "ad-danger-row" }, [
+      el("div", null, [
+        el("div", { class: "ad-danger-title" }, "Flush all channels"),
+        el("div", { class: "muted sm" }, "Deletes every channel except the lobby, plus all messages and reactions. Users and uploads survive."),
+      ]),
+      el("button", { class: "btn btn-danger", type: "button",
+        onclick: () => flushCategory("channels", "/reset/channels", "Flush all channels?",
+          "Deletes every channel (lobby is recreated empty), all messages, and all reactions. Users, uploads, settings, and banned lists are kept.") }, "Flush channels…"),
+    ]),
+    el("div", { class: "ad-danger-row" }, [
+      el("div", null, [
+        el("div", { class: "ad-danger-title" }, "Flush all messages"),
+        el("div", { class: "muted sm" }, "Clears every channel's message history and reactions. Channels and members survive."),
+      ]),
+      el("button", { class: "btn btn-danger", type: "button",
+        onclick: () => flushCategory("messages", "/reset/messages", "Flush all messages?",
+          "Deletes every message and reaction from every channel. Channels, members, users, and uploads are kept.") }, "Flush messages…"),
+    ]),
+    el("div", { class: "ad-danger-row" }, [
+      el("div", null, [
+        el("div", { class: "ad-danger-title" }, "Factory reset (wipe all data)"),
+        el("div", { class: "muted sm" }, "Master switch — does all of the above plus uploads. Server settings, banned lists, and the certificate are kept."),
+      ]),
+      el("button", { class: "btn btn-danger", type: "button", onclick: resetServer }, "Wipe all data…"),
+    ]),
   ]);
 }
 
@@ -1019,6 +1222,48 @@ async function shutdownServer() {
   if (!ok) return;
   try { await api("/shutdown", { method: "POST" }); } catch {}
   toast("Server shutting down.");
+}
+
+async function resetServer() {
+  const ok = await confirmDialog({
+    title: "Wipe ALL server data?",
+    body:
+      "This permanently deletes every user, channel, direct message, " +
+      "reaction, uploaded file, and session record.\n\n" +
+      "Server settings, banned users/IPs, the TLS certificate, and " +
+      "application logs are kept.\n\n" +
+      "This cannot be undone. Active users will be disconnected.",
+    okText: "Continue", okClass: "btn-danger",
+  });
+  if (!ok) return;
+  const typed = window.prompt('Type "RESET" (uppercase) to confirm.', "");
+  if (typed !== "RESET") { toast("Reset cancelled."); return; }
+  try {
+    await api("/reset", { method: "POST", body: JSON.stringify({ confirm: "RESET" }) });
+    toast("All data wiped. Reloading…");
+    setTimeout(() => location.reload(), 1200);
+  } catch (err) {
+    toast("Reset failed: " + err.message);
+  }
+}
+
+/// Generic two-step flush for one category. Used by the per-category
+/// danger-zone buttons; the master "wipe all" stays as resetServer().
+async function flushCategory(kind, endpoint, title, body) {
+  const ok = await confirmDialog({
+    title, body: body + "\n\nThis cannot be undone.",
+    okText: "Continue", okClass: "btn-danger",
+  });
+  if (!ok) return;
+  const typed = window.prompt(`Type "RESET" (uppercase) to flush ${kind}.`, "");
+  if (typed !== "RESET") { toast("Flush cancelled."); return; }
+  try {
+    await api(endpoint, { method: "POST", body: JSON.stringify({ confirm: "RESET" }) });
+    toast(`Flushed ${kind}. Refreshing…`);
+    setTimeout(() => refreshAll(), 600);
+  } catch (err) {
+    toast("Flush failed: " + err.message);
+  }
 }
 function waitForServerBack() {
   let tries = 0; const max = 30;
@@ -1193,7 +1438,7 @@ function init() {
     if (e.key === "t" || e.key === "T") toggleTheme();
     if (e.key === "g") {
       // gN = jump to nth section
-      const order = ["overview","users","channels","uploads","logs","share","broadcast","settings"];
+      const order = ["overview","users","sessions","channels","uploads","logs","share","broadcast","settings"];
       const next = (ev) => {
         const i = parseInt(ev.key, 10);
         if (!Number.isNaN(i) && i >= 1 && i <= order.length) setRoute(order[i - 1]);

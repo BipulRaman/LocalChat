@@ -75,6 +75,12 @@ local-ip-address = "0.6"
 opener      = "0.7"
 dirs        = "5"
 
+# Embedded SQLite — the single source of truth for users, channels,
+# messages, reactions, sessions, bans, and upload metadata. Bundled
+# means we statically link the C amalgamation (no system sqlite3.dll
+# required). Adds ~1–1.5 MB to the release binary.
+rusqlite    = { version = "0.32", default-features = false, features = ["bundled"] }
+
 # Allocator — drops RSS significantly
 mimalloc    = { version = "0.1", default-features = false }
 

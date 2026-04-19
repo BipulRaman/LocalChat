@@ -22,7 +22,7 @@ use crate::message::{now_secs, FileInfo, MsgKind, WireMsg};
 use crate::state::AppState;
 use crate::user::{UserId, UserInfo};
 
-pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
+pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, user_agent: String) {
     state.metrics.inc_connect();
     let (mut sink, mut stream) = socket.split();
 
@@ -162,24 +162,48 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
         msg_count: prior.as_ref().map(|p| p.msg_count).unwrap_or(0),
         bytes_uploaded: prior.as_ref().map(|p| p.bytes_uploaded).unwrap_or(0),
         pubkey,
+        last_ip: peer_ip.to_compact_string(),
+        last_seen: prior.as_ref().map(|p| p.last_seen).unwrap_or(0),
+        last_connect: now_secs(),
+        total_sessions: prior.as_ref().map(|p| p.total_sessions).unwrap_or(0) + 1,
     };
     state.users.insert(user_id, info.clone());
     state.known_users.insert(user_id, info.clone());
-    let was_offline = {
+    let socket_count = {
         let mut entry = state.connections.entry(user_id).or_insert(0);
-        let prev = *entry;
         *entry += 1;
-        prev == 0
+        *entry
     };
+    let was_offline = socket_count == 1;
+    let session_started = now_secs();
     crate::applog::log(format_args!(
         "join: user={} id={} ip={} (sockets={})",
-        info.username, user_id, peer_ip,
-        state.connections.get(&user_id).map(|e| *e).unwrap_or(0),
+        info.username, user_id, peer_ip, socket_count,
     ));
 
+    // Persistent audit trail — always append, every socket open.
+    let _ = state.db.append_session_event(
+        "connect",
+        user_id,
+        &info.username,
+        &peer_ip,
+        &user_agent,
+        session_started,
+        None,
+        Some(socket_count),
+    ).await;
+
     // Persist identity table so the same user keeps the same id across
-    // server restarts. Cheap and infrequent.
-    state.save_users().await;
+    // server restarts. New user → INSERT; returning user → UPDATE
+    // last_connect/total_sessions/last_ip and refresh avatar/color/pubkey.
+    if prior.is_some() {
+        let _ = state.db.touch_user_on_connect(
+            user_id, &info.avatar, &info.color, &info.pubkey,
+            &peer_ip, session_started,
+        ).await;
+    } else {
+        let _ = state.db.create_user(&info).await;
+    }
 
     // Auto-join the lobby.
     let lobby = state.channels.get(LOBBY_ID).expect("lobby always exists");
@@ -218,24 +242,48 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     }
 
     // Welcome envelope.
+    // Issue a per-socket session token. Used by the HTTP /api/upload
+    // endpoint to identify the user without a separate auth layer; the
+    // token lives only as long as this WS connection.
+    let session_token: CompactString = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .to_compact_string();
+    state.sessions.insert(session_token.clone(), user_id);
+
     let welcome = json!({
         "ev": "welcome",
         "user": info,
         "channels": state.channels.visible_to(user_id),
         "users": state.users.iter().map(|e| e.value().clone()).collect::<Vec<_>>(),
         "lobby": LOBBY_ID,
+        "session": session_token,
     });
     if sink.send(Message::Text(welcome.to_string())).await.is_err() {
-        cleanup(&state, user_id).await;
+        // Session token is intentionally NOT removed on disconnect:
+        // an in-flight HTTP upload (which can take many seconds for a
+        // large video) needs to look it up after the WS has closed.
+        // Tokens accumulate but are bounded by user count and reset on
+        // process restart — fine for LAN scope.
+        cleanup(&state, user_id, &peer_ip, session_started).await;
         return;
     }
 
     // Send lobby recent history.
-    send_history(&mut sink, &lobby, 50).await;
+    send_history(&mut sink, &lobby, &state.db, 50).await;
 
-    // Broadcast "X joined" only on the user's first concurrent socket.
+    // Announce in lobby ONLY the very first time a user registers
+    // (no prior identity row in the DB). Subsequent reconnects /
+    // re-logins update presence silently — no chat spam.
+    let is_first_registration = prior.is_none();
     if was_offline {
-        broadcast_system(&state, &lobby, &format!("{} joined the chat", info.username)).await;
+        if is_first_registration {
+            broadcast_system(
+                &state,
+                &lobby,
+                &format!("👋 {} joined LocalChat", info.username),
+            ).await;
+        }
         broadcast_users(&state).await;
     } else {
         // Still refresh presence for *this* socket so its UI is correct.
@@ -248,8 +296,34 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     for cid in rebound_dms { own_channels.push(cid); }
     for cid in my_channels { if !own_channels.iter().any(|c| c == &cid) { own_channels.push(cid); } }
 
+    // Subscribe to the admin kick bus so a flush/reset boots us instantly
+    // instead of waiting for the next op to fail.
+    let mut kick_rx = state.kick_tx.subscribe();
+
     loop {
         tokio::select! {
+            // Admin kick
+            kicked = kick_rx.recv() => {
+                match kicked {
+                    Ok(crate::state::KickSignal::All) => {
+                        let _ = sink.send(Message::Text(
+                            r#"{"ev":"kicked","reason":"server reset"}"#.into(),
+                        )).await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Ok(crate::state::KickSignal::User(uid)) if uid == user_id => {
+                        let _ = sink.send(Message::Text(
+                            r#"{"ev":"kicked","reason":"removed by admin"}"#.into(),
+                        )).await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    // Lagged or unrelated kick — ignore.
+                    _ => continue,
+                }
+            }
+
             // Incoming ops
             incoming = stream.next() => {
                 let Some(Ok(msg)) = incoming else { break };
@@ -334,22 +408,108 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     }
 
     // ---- Disconnect cleanup.
-    cleanup(&state, user_id).await;
+    // Note: session_token is intentionally retained — see comment in
+    // the welcome-send block above.
+    let _ = session_token;
+    cleanup(&state, user_id, &peer_ip, session_started).await;
 }
 
-async fn cleanup(state: &Arc<AppState>, user_id: UserId) {
+async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_started: u64) {
     // Decrement socket count; only fully "leave" when it hits zero.
-    let still_online = {
+    let (still_online, sockets_remaining) = {
         let mut entry = state.connections.entry(user_id).or_insert(0);
         if *entry > 0 { *entry -= 1; }
         let n = *entry;
-        if n == 0 { drop(entry); state.connections.remove(&user_id); false } else { true }
+        let still = n > 0;
+        if !still { drop(entry); state.connections.remove(&user_id); }
+        (still, n)
     };
+    let now = crate::message::now_secs();
+    let duration = now.saturating_sub(session_started);
+
+    // If a factory/users reset is in progress, skip per-user audit and
+    // identity writes so we don't race against the DB flush and leave
+    // ghost rows in `session_events` / `users`.
+    let resetting = state
+        .resetting
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let username_for_audit = state
+        .known_users
+        .get(&user_id)
+        .map(|e| e.value().username.to_string())
+        .unwrap_or_default();
+    if !resetting {
+        // Always record the per-socket disconnect in the audit log.
+        let _ = state.db.append_session_event(
+            "disconnect",
+            user_id,
+            &username_for_audit,
+            peer_ip,
+            "",
+            now,
+            Some(duration),
+            Some(sockets_remaining),
+        ).await;
+
+        // Update the persisted identity so the admin page can show "last seen
+        // from <ip> at <time>" even after restart.
+        if let Some(mut k) = state.known_users.get_mut(&user_id) {
+            k.last_seen = now;
+            k.last_ip = peer_ip.to_compact_string();
+        }
+        let _ = state.db.update_user_on_disconnect(user_id, peer_ip, now).await;
+    }
+
     if still_online {
         // Another tab/window is still open for this user. Keep presence
         // and channel memberships intact.
         state.metrics.dec_connect();
         return;
+    }
+
+    // If this user was in any in-flight call, finalize it now so the
+    // chat shows what happened instead of leaving a dangling session.
+    // (Skipped during a reset — the calls map is wiped wholesale and
+    // we don't want to insert orphan messages back into the DB.)
+    if !resetting {
+        let abandoned: Vec<crate::message::ChannelId> = state
+            .calls
+            .iter()
+            .filter(|e| e.value().caller_id == user_id || e.value().callee_id == user_id)
+            .map(|e| e.key().clone())
+            .collect();
+        for cid in abandoned {
+            if let Some((_, session)) = state.calls.remove(&cid) {
+                if let Some(ch) = state.channels.get(&cid) {
+                    let icon = if session.video { "📹" } else { "📞" };
+                    let text = if let Some(ans) = session.answered_at {
+                        let dur = now.saturating_sub(ans);
+                        format!("{icon} Call ended · {}", fmt_duration(dur))
+                    } else {
+                        format!("{icon} Missed call")
+                    };
+                    let msg = Arc::new(WireMsg {
+                        id: state.next_msg_id(),
+                        channel: ch.id.clone(),
+                        kind: MsgKind::System,
+                        user_id: session.caller_id,
+                        username: session.caller_name.clone(),
+                        avatar: CompactString::const_new(""),
+                        color: CompactString::const_new(""),
+                        ts: now,
+                        text,
+                        file: None,
+                        reply_to: None,
+                        edited_at: None,
+                        deleted: false,
+                    });
+                    ch.push_history(msg.clone()).await;
+                    let _ = state.db.insert_message(&msg).await;
+                    let _ = ch.tx.send(msg);
+                }
+            }
+        }
     }
 
     let removed = state.users.remove(&user_id).map(|(_, v)| v);
@@ -369,9 +529,9 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId) {
         crate::applog::log(format_args!(
             "leave: user={} id={}", u.username, user_id
         ));
-        if let Some(lobby) = state.channels.get(LOBBY_ID) {
-            broadcast_system(state, &lobby, &format!("{} left the chat", u.username)).await;
-        }
+        // No "X left the chat" system message — presence is conveyed
+        // by the live user list, and posting on every disconnect was
+        // chat spam (especially with reload-heavy browser sessions).
         broadcast_users(state).await;
     }
 }
@@ -441,9 +601,12 @@ fn msg_to_json(m: &WireMsg) -> String {
 
 type WsSink = futures_util::stream::SplitSink<WebSocket, Message>;
 
-async fn send_history(sink: &mut WsSink, ch: &Channel, limit: usize) {
-    let recent = ch.recent(limit).await;
-    let v: Vec<&WireMsg> = recent.iter().map(|a| a.as_ref()).collect();
+async fn send_history(sink: &mut WsSink, ch: &Channel, db: &crate::db::Db, limit: usize) {
+    // Always source from SQLite — the in-memory ring is volatile
+    // (lost on restart, capped, and only fully populated by live
+    // traffic). DB is the single source of truth for chat history.
+    let recent: Vec<WireMsg> = db.tail_messages(&ch.id, limit).await.unwrap_or_default();
+    let v: Vec<&WireMsg> = recent.iter().collect();
     let out = json!({ "ev": "history", "channel": ch.id, "messages": v });
     let _ = sink.send(Message::Text(out.to_string())).await;
 }
@@ -487,7 +650,7 @@ async fn broadcast_system(state: &Arc<AppState>, ch: &Channel, text: &str) {
         deleted: false,
     });
     ch.push_history(msg.clone()).await;
-    state.history.append(&msg).await;
+    let _ = state.db.insert_message(&msg).await;
     let _ = ch.tx.send(msg);
 }
 
@@ -573,9 +736,10 @@ async fn handle_op(
                 deleted: false,
             });
             ch.push_history(msg.clone()).await;
-            state.history.append(&msg).await;
+            let _ = state.db.insert_message(&msg).await;
             state.metrics.inc_messages();
             bump_user_msg_count(state, user_id);
+            let _ = state.db.bump_user_msg_count(user_id).await;
             let _ = ch.tx.send(msg);
         }
 
@@ -592,6 +756,18 @@ async fn handle_op(
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
             if !can_send(&ch, user_id) {
                 return Err("not a member".into());
+            }
+            // Idempotency: if the client retried this op (e.g. after a
+            // page refresh between upload completion and the WS frame
+            // being delivered), the same file_id is already attached
+            // to a message. Re-broadcast that one instead of inserting
+            // a duplicate.
+            if let Ok(Some(existing_id)) = state.db.message_id_for_file(file.id.as_str()).await {
+                let recent = state.db.tail_messages(channel_id.as_str(), 500).await.unwrap_or_default();
+                if let Some(existing) = recent.into_iter().find(|m| m.id == existing_id) {
+                    let _ = ch.tx.send(Arc::new(existing));
+                }
+                return Ok(());
             }
             let user = state.users.get(&user_id).ok_or("user gone")?.clone();
             let msg = Arc::new(WireMsg {
@@ -614,7 +790,11 @@ async fn handle_op(
                 deleted: false,
             });
             ch.push_history(msg.clone()).await;
-            state.history.append(&msg).await;
+            let file_size = msg.file.as_ref().map(|f| f.size).unwrap_or(0);
+            let _ = state.db.insert_message(&msg).await;
+            if file_size > 0 {
+                let _ = state.db.bump_user_uploaded(user_id, file_size).await;
+            }
             state.metrics.inc_messages();
             let _ = ch.tx.send(msg);
         }
@@ -679,7 +859,8 @@ async fn handle_op(
             let out = json!({"ev":"ch_created","channel":ch.meta()});
             let _ = sink.send(Message::Text(out.to_string())).await;
             broadcast_system(state, &ch, &format!("Channel #{} created", ch.name)).await;
-            state.save_channels().await;
+            let _ = state.db.upsert_channel(&ch.meta()).await;
+            let _ = state.db.add_member(&ch.id, user_id, now_secs()).await;
         }
 
         "ch_join" => {
@@ -697,14 +878,14 @@ async fn handle_op(
                 rxs.push(ch.tx.subscribe());
                 own_channels.push(ch.id.clone());
             }
-            send_history(sink, &ch, 50).await;
+            send_history(sink, &ch, &state.db, 50).await;
             let username = state
                 .users
                 .get(&user_id)
                 .map(|u| u.value().username.to_string())
                 .unwrap_or_default();
             broadcast_system(state, &ch, &format!("{} joined #{}", username, ch.name)).await;
-            state.save_channels().await;
+            let _ = state.db.add_member(&ch.id, user_id, now_secs()).await;
         }
 
         "ch_leave" => {
@@ -723,7 +904,7 @@ async fn handle_op(
                 // will drop the receiver when the channel empties or the
                 // socket closes. Correctness unaffected.
             }
-            state.save_channels().await;
+            let _ = state.db.remove_member(id, user_id).await;
         }
 
         "ch_invite" => {
@@ -805,7 +986,10 @@ async fn handle_op(
                     let text = format!("{} added {} to #{}", inviter_name, joined, ch.name);
                     broadcast_system(state, &ch, &text).await;
                 }
-                state.save_channels().await;
+                let now = now_secs();
+                for (uid, _) in &added {
+                    let _ = state.db.add_member(&ch.id, *uid, now).await;
+                }
             }
         }
 
@@ -828,7 +1012,7 @@ async fn handle_op(
             }
             let out = json!({"ev":"ch_created","channel":ch.meta()});
             let _ = sink.send(Message::Text(out.to_string())).await;
-            send_history(sink, &ch, 50).await;
+            send_history(sink, &ch, &state.db, 50).await;
 
             // Tell the peer's WS handler (via the lobby bus) to subscribe to
             // this DM channel as well, so messages reach them in real-time
@@ -855,7 +1039,9 @@ async fn handle_op(
                     deleted: false,
                 }));
             }
-            state.save_channels().await;
+            let _ = state.db.upsert_channel(&ch.meta()).await;
+            let _ = state.db.add_member(&ch.id, user_id, now_secs()).await;
+            let _ = state.db.add_member(&ch.id, peer, now_secs()).await;
         }
 
         "dm_delete" => {
@@ -887,14 +1073,13 @@ async fn handle_op(
             }));
             // Detach all members and drop the channel.
             state.channels.delete_dm(&id_str);
-            // Wipe persisted history.
-            state.history.delete_channel(&id_str).await;
+            // Wipe persisted history (cascades messages, members, reactions).
+            let _ = state.db.delete_channel(&id_str).await;
             // Drop our own subscription so the local rxs loop stops polling it.
             own_channels.retain(|c| c != &id_str);
             let _ = sink
                 .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
                 .await;
-            state.save_channels().await;
         }
 
         "ch_delete" => {
@@ -924,14 +1109,14 @@ async fn handle_op(
                 deleted: true,
             }));
             state.channels.delete_any(&id_str);
-            state.history.delete_channel(&id_str).await;
+            // Cascades messages, members, and reactions in the DB.
+            let _ = state.db.delete_channel(&id_str).await;
             // Drop reactions for this channel.
             state.reactions.retain(|(c, _), _| c != &id_str);
             own_channels.retain(|c| c != &id_str);
             let _ = sink
                 .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
                 .await;
-            state.save_channels().await;
         }
 
         "history" => {
@@ -944,13 +1129,10 @@ async fn handle_op(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .min(500) as usize;
-            // RAM first, then fall back to disk if emptier than requested.
-            let ch = state.channels.get(id).ok_or("no such channel")?;
-            let mut out = ch.recent(limit).await;
-            if out.len() < limit {
-                let from_disk = state.history.tail(id, limit).await;
-                out = from_disk;
-            }
+            // Authoritative read from SQLite — never trust in-memory ring.
+            let _ch = state.channels.get(id).ok_or("no such channel")?;
+            let from_db = state.db.tail_messages(id, limit).await.unwrap_or_default();
+            let out: Vec<Arc<WireMsg>> = from_db.into_iter().map(Arc::new).collect();
             let msgs: Vec<&WireMsg> = out.iter().map(|a| a.as_ref()).collect();
             let reactions = collect_reactions(state, &id.to_compact_string());
             let resp = json!({
@@ -1004,14 +1186,12 @@ async fn handle_op(
                 state.reactions.remove(&(channel_id.clone(), msg_id));
             }
 
-            // Persist the toggle event so reactions survive restart.
-            state.reaction_log.append(&crate::persist::ReactionEvent {
-                c: channel_id.to_string(),
-                m: msg_id,
-                u: user_id,
-                e: emoji.to_string(),
-                on,
-            }).await;
+            // Persist the toggle so reactions survive restart. The DB
+            // performs its own toggle and writes a row in `reactions` +
+            // appends an audit row in `reaction_events`.
+            let _ = state.db.toggle_reaction(
+                &channel_id, msg_id, user_id, &emoji, now_secs(),
+            ).await;
 
             let username = state
                 .users
@@ -1073,6 +1253,89 @@ async fn handle_op(
                 .get(&user_id)
                 .map(|e| e.value().username.to_string())
                 .unwrap_or_default();
+
+            // ── Call lifecycle bookkeeping ────────────────────────────
+            // Server tracks each in-flight DM call so we can post a
+            // single, accurate system message when it concludes —
+            // visible in chat history and persisted to SQLite.
+            match kind {
+                "offer" => {
+                    // Identify the callee: the other DM member.
+                    let callee_id = ch
+                        .members
+                        .iter()
+                        .map(|e| *e)
+                        .find(|uid| *uid != user_id)
+                        .unwrap_or(0);
+                    let callee_name = state
+                        .users
+                        .get(&callee_id)
+                        .map(|e| e.value().username.to_string())
+                        .unwrap_or_default();
+                    let video = v
+                        .get("payload")
+                        .and_then(|p| p.get("video"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    state.calls.insert(
+                        channel_id.clone(),
+                        crate::state::CallSession {
+                            caller_id: user_id,
+                            caller_name: username.to_compact_string(),
+                            callee_id,
+                            callee_name: callee_name.to_compact_string(),
+                            video,
+                            started_at: now_secs(),
+                            answered_at: None,
+                        },
+                    );
+                }
+                "answer" => {
+                    if let Some(mut s) = state.calls.get_mut(&channel_id) {
+                        if s.answered_at.is_none() {
+                            s.answered_at = Some(now_secs());
+                        }
+                    }
+                }
+                "end" | "decline" | "busy" => {
+                    // Atomic remove ensures we post the summary exactly
+                    // once even if both peers send "end".
+                    if let Some((_, session)) = state.calls.remove(&channel_id) {
+                        let icon = if session.video { "📹" } else { "📞" };
+                        let text = if let Some(ans) = session.answered_at {
+                            let dur = now_secs().saturating_sub(ans);
+                            format!("{icon} Call ended · {}", fmt_duration(dur))
+                        } else if kind == "decline" {
+                            format!("{icon} Call declined")
+                        } else if kind == "busy" {
+                            format!("{icon} Missed call (busy)")
+                        } else {
+                            // "end" with no prior answer = caller cancelled / callee never picked up
+                            format!("{icon} Missed call")
+                        };
+                        let msg = Arc::new(WireMsg {
+                            id: state.next_msg_id(),
+                            channel: ch.id.clone(),
+                            kind: MsgKind::System,
+                            user_id: session.caller_id,
+                            username: session.caller_name.clone(),
+                            avatar: CompactString::const_new(""),
+                            color: CompactString::const_new(""),
+                            ts: now_secs(),
+                            text,
+                            file: None,
+                            reply_to: None,
+                            edited_at: None,
+                            deleted: false,
+                        });
+                        ch.push_history(msg.clone()).await;
+                        let _ = state.db.insert_message(&msg).await;
+                        let _ = ch.tx.send(msg);
+                    }
+                }
+                _ => {}
+            }
+
             let ev = json!({
                 "ev": "call",
                 "channel": channel_id,
@@ -1149,6 +1412,19 @@ fn can_send(ch: &Channel, user: UserId) -> bool {
 fn bump_user_msg_count(state: &Arc<AppState>, user_id: UserId) {
     if let Some(mut u) = state.users.get_mut(&user_id) {
         u.msg_count += 1;
+    }
+}
+
+/// Render a duration as `H:MM:SS` (or `M:SS` when under an hour) for
+/// the call-summary system message.
+fn fmt_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
     }
 }
 

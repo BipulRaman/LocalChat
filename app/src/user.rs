@@ -11,9 +11,9 @@ pub struct UserInfo {
     pub username: CompactString,
     pub avatar: CompactString, // emoji or single letter
     pub color: CompactString,  // hex "#rrggbb"
-    pub joined_at: u64,        // seconds since UNIX epoch
+    pub joined_at: u64,        // seconds since UNIX epoch — first ever join
     #[serde(skip)]
-    pub ip: CompactString,
+    pub ip: CompactString,     // IP of the *current* live socket (presence)
     #[serde(default)]
     pub msg_count: u64,
     #[serde(default)]
@@ -22,4 +22,21 @@ pub struct UserInfo {
     /// Server never touches this; it just relays it so peers can encrypt DMs.
     #[serde(default)]
     pub pubkey: CompactString,
+    /// IP address used on the most recent connection (persisted, survives
+    /// restarts so the admin page can show "last seen from …" for offline
+    /// users).
+    #[serde(default)]
+    pub last_ip: CompactString,
+    /// Unix seconds of the most recent disconnect. 0 if the user has
+    /// never disconnected since first joining (i.e. is currently online
+    /// and has never had a session end yet).
+    #[serde(default)]
+    pub last_seen: u64,
+    /// Unix seconds of the most recent successful connection. Used by the
+    /// admin page to show "online since" for live users.
+    #[serde(default)]
+    pub last_connect: u64,
+    /// Total number of WebSocket sessions this user has ever opened.
+    #[serde(default)]
+    pub total_sessions: u64,
 }
