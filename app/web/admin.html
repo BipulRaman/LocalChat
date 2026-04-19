@@ -116,6 +116,43 @@
     </section>
 
     <section class="panel">
+      <h2>Updates</h2>
+      <div id="updateBox" class="update-box">
+        <div class="update-row">
+          <div>
+            <div class="muted sm">Current version</div>
+            <div id="updCurrent" class="update-ver">—</div>
+          </div>
+          <div>
+            <div class="muted sm">Latest release</div>
+            <div id="updLatest" class="update-ver">checking…</div>
+          </div>
+          <div class="update-actions">
+            <button class="btn btn-ghost" type="button" onclick="checkForUpdates(true)">Check now</button>
+            <a id="updDownload" class="btn btn-primary hidden" href="#" target="_blank" rel="noopener">Download update</a>
+          </div>
+        </div>
+        <p id="updStatus" class="muted sm" style="margin:8px 0 0"></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>App logs</h2>
+      <div class="logs-toolbar">
+        <label class="muted sm">Tail lines
+          <input id="logsLines" type="number" min="20" max="5000" value="200" style="width:90px;margin-left:6px"/>
+        </label>
+        <button class="btn btn-ghost" type="button" onclick="loadLogs()">Refresh</button>
+        <label class="checkbox" style="margin-left:auto">
+          <input id="logsAuto" type="checkbox"/>
+          <span>Auto-refresh (5s)</span>
+        </label>
+      </div>
+      <pre id="logsView" class="logs-view" aria-label="Application log tail"></pre>
+      <p id="logsMeta" class="muted sm"></p>
+    </section>
+
+    <section class="panel">
       <h2>Settings</h2>
       <form id="settingsForm" onsubmit="saveSettings(event)">
         <label>Port override (0 = auto)

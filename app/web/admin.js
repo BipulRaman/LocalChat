@@ -85,6 +85,8 @@ async function refreshAll() {
     renderUploads(uploads.files);
     loadSettings(settings);
     renderShare(share.entries || []);
+    loadLogs();
+    checkForUpdates(false);
   } catch (err) { console.error(err); toast("Error: " + err.message); }
 }
 
@@ -241,7 +243,110 @@ async function broadcast(e) {
   } catch (err) { toast("Error: " + err.message); }
 }
 
-Object.assign(window, { saveToken, logoutAdmin, refreshAll, saveSettings, broadcast, toggleTheme, restartServer, shutdownServer });
+Object.assign(window, { saveToken, logoutAdmin, refreshAll, saveSettings, broadcast, toggleTheme, restartServer, shutdownServer, loadLogs, checkForUpdates });
+
+// ── App logs ────────────────────────────────────────────────────────
+let _logsTimer = null;
+async function loadLogs() {
+  const lines = parseInt($("logsLines").value, 10) || 200;
+  try {
+    const r = await api(`/logs?lines=${lines}`);
+    const view = $("logsView");
+    view.textContent = (r.lines || []).join("\n");
+    // Pin to bottom so newest entries are visible.
+    view.scrollTop = view.scrollHeight;
+    $("logsMeta").textContent = r.path
+      ? `${r.lines.length} of ${r.total} lines · ${r.path}`
+      : "Log file not initialized.";
+  } catch (err) {
+    $("logsMeta").textContent = "Error loading logs: " + err.message;
+  }
+}
+function setupLogsAuto() {
+  const cb = $("logsAuto");
+  if (!cb) return;
+  const apply = () => {
+    if (_logsTimer) { clearInterval(_logsTimer); _logsTimer = null; }
+    if (cb.checked) _logsTimer = setInterval(loadLogs, 5000);
+  };
+  cb.addEventListener("change", apply);
+  apply();
+}
+
+// ── Update check (queries GitHub releases from the browser) ─────────
+const REPO = "BipulRaman/LocalChat";
+let _currentVersion = null;
+let _lastUpdateCheck = 0;
+
+async function fetchCurrentVersion() {
+  if (_currentVersion) return _currentVersion;
+  try {
+    const r = await fetch("/api/info", { cache: "no-store" });
+    if (r.ok) {
+      const j = await r.json();
+      _currentVersion = j.version || null;
+    }
+  } catch {}
+  return _currentVersion;
+}
+
+function compareSemver(a, b) {
+  const parse = (v) => String(v).replace(/^v/i, "").split(/[.-]/).map((p) => parseInt(p, 10) || 0);
+  const A = parse(a), B = parse(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const da = A[i] || 0, db = B[i] || 0;
+    if (da !== db) return da < db ? -1 : 1;
+  }
+  return 0;
+}
+
+async function checkForUpdates(forceUi) {
+  // Throttle background checks to once per hour.
+  const now = Date.now();
+  if (!forceUi && now - _lastUpdateCheck < 3600 * 1000) return;
+  _lastUpdateCheck = now;
+
+  const cur = await fetchCurrentVersion();
+  if ($("updCurrent")) $("updCurrent").textContent = cur ? "v" + cur : "—";
+  const latestEl = $("updLatest");
+  const dlBtn = $("updDownload");
+  const status = $("updStatus");
+  if (latestEl) latestEl.textContent = "checking…";
+  if (status) status.textContent = "";
+
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+      headers: { "Accept": "application/vnd.github+json" },
+      cache: "no-store",
+    });
+    if (!r.ok) throw new Error("GitHub API " + r.status);
+    const rel = await r.json();
+    const tag = (rel.tag_name || "").trim();
+    if (!tag) throw new Error("no tag in release");
+    if (latestEl) latestEl.textContent = tag;
+
+    const cmp = cur ? compareSemver(cur, tag) : -1;
+    if (cmp < 0) {
+      // Prefer a Windows .exe asset if present, else the release page.
+      let url = rel.html_url || `https://github.com/${REPO}/releases/latest`;
+      const asset = (rel.assets || []).find((a) => /\.exe$/i.test(a.name) || /\.msi$/i.test(a.name));
+      if (asset && asset.browser_download_url) url = asset.browser_download_url;
+      if (dlBtn) {
+        dlBtn.href = url;
+        dlBtn.classList.remove("hidden");
+        dlBtn.textContent = asset ? `Download ${asset.name}` : "Open release page";
+      }
+      if (status) status.textContent = `A newer version is available (${tag}).`;
+      if (forceUi) toast(`Update available: ${tag}`);
+    } else {
+      if (dlBtn) dlBtn.classList.add("hidden");
+      if (status) status.textContent = "You are on the latest version.";
+    }
+  } catch (err) {
+    if (latestEl) latestEl.textContent = "unavailable";
+    if (status) status.textContent = "Could not check for updates: " + err.message;
+  }
+}
 
 async function restartServer() {
   if (!confirm("Restart the server now? Active connections will drop and reconnect automatically.")) return;
@@ -295,4 +400,5 @@ function updateThemeIcon() {
 }
 updateThemeIcon();
 init();
+setupLogsAuto();
 setInterval(() => { if (token) api("/stats").then(renderStats).catch(() => {}); }, 5000);

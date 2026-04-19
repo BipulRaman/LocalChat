@@ -28,6 +28,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/uploads", get(list_uploads))
         .route("/upload/:filename", axum::routing::delete(delete_upload))
         .route("/share", get(share))
+        .route("/logs", get(logs))
         .route("/restart", post(restart))
         .route("/shutdown", post(shutdown))
 }
@@ -404,6 +405,42 @@ fn render_qr_svg(data: &str) -> String {
             .build(),
         Err(_) => String::new(),
     }
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    lines: Option<usize>,
+}
+
+/// Tail the application log file. Returns the last `lines` lines (default
+/// 200, capped at 5000) so the admin page can show recent activity.
+async fn logs(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    let limit = q.lines.unwrap_or(200).clamp(1, 5000);
+    let path = match crate::applog::path() {
+        Some(p) => p,
+        None => {
+            return Ok(Json(json!({
+                "lines": Vec::<String>::new(),
+                "path": serde_json::Value::Null,
+                "total": 0
+            })));
+        }
+    };
+    let body = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let lines_vec: Vec<&str> = body.lines().collect();
+    let start = lines_vec.len().saturating_sub(limit);
+    let tail: Vec<&str> = lines_vec[start..].to_vec();
+    Ok(Json(json!({
+        "lines": tail,
+        "path": path.display().to_string(),
+        "total": lines_vec.len(),
+    })))
 }
 
 #[cfg(windows)]

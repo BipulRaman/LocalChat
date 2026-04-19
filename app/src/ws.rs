@@ -84,7 +84,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
         return;
     }
 
-    let user_id = state.next_user_id();
+    let user_id = assign_user_id(&state, &username);
     let info = UserInfo {
         id: user_id,
         username: username.clone(),
@@ -239,6 +239,21 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId) {
         }
         broadcast_users(state).await;
     }
+}
+
+/// Pick a UserId for this username. Reuses the previously assigned ID if
+/// the username has joined before in this process (so reloading the page
+/// doesn't keep bumping the counter). If a *currently online* user already
+/// holds that ID, we allocate a fresh one to avoid a collision.
+fn assign_user_id(state: &Arc<AppState>, username: &CompactString) -> UserId {
+    if let Some(existing) = state.username_to_id.get(username).map(|v| *v) {
+        if !state.users.contains_key(&existing) {
+            return existing;
+        }
+    }
+    let id = state.next_user_id();
+    state.username_to_id.insert(username.clone(), id);
+    id
 }
 
 fn sanitize_username(u: &str) -> CompactString {

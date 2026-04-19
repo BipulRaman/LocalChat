@@ -26,6 +26,10 @@ pub struct AppState {
     pub config: RwLock<Config>,
     pub channels: ChannelRegistry,
     pub users: DashMap<UserId, UserInfo>,
+    /// Maps username → user_id so reloading the page reuses the same ID
+    /// (rather than incrementing the counter on every WS reconnect).
+    /// Lives for the life of the process.
+    pub username_to_id: DashMap<compact_str::CompactString, UserId>,
     pub history: HistoryStore,
     pub metrics: Metrics,
 
@@ -80,6 +84,7 @@ impl AppState {
             config: RwLock::new(config),
             channels: ChannelRegistry::new(history_cap),
             users: DashMap::new(),
+            username_to_id: DashMap::new(),
             history: HistoryStore::new(history_dir, rotate_mb),
             metrics: Metrics::default(),
             reactions: DashMap::new(),
