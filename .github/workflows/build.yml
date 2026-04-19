@@ -17,8 +17,43 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  version:
+    name: Compute release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Compute next version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            git fetch --tags --force >/dev/null 2>&1 || true
+            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+            if [[ -z "$LATEST" ]]; then
+              TAG="v0.1.0"
+            else
+              IFS='.' read -r MA MI PA <<< "${LATEST#v}"
+              TAG="v${MA}.${MI}.$((PA + 1))"
+            fi
+          fi
+          echo "Selected tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Bare semver (no leading 'v') for embedding in the binary.
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Windows x64
+    needs: version
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -39,6 +74,11 @@ jobs:
       - name: Build
         shell: bash
         working-directory: app
+        env:
+          # Stamped into the exe via option_env!() in src/http.rs so
+          # /api/info reports the same version as the GitHub release
+          # tag, not the stale Cargo.toml value.
+          LOCALCHAT_VERSION: ${{ needs.version.outputs.version }}
         run: |
           cargo build --release --target x86_64-pc-windows-msvc --features tray
 
@@ -63,7 +103,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history + tags)
@@ -83,35 +123,11 @@ jobs:
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
 
-      - name: Compute next version
-        id: meta
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            # Tag push: use the tag as-is.
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            # Auto-bump patch from the highest existing vMAJOR.MINOR.PATCH tag.
-            git fetch --tags --force >/dev/null 2>&1 || true
-            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
-              | sort -V \
-              | tail -n1)
-            if [[ -z "$LATEST" ]]; then
-              TAG="v0.1.0"
-            else
-              IFS='.' read -r MA MI PA <<< "${LATEST#v}"
-              TAG="v${MA}.${MI}.$((PA + 1))"
-            fi
-          fi
-          echo "Selected tag: $TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "name=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Create / update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true

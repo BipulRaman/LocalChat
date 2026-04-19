@@ -134,10 +134,20 @@ async fn ws_upgrade(
 // ── Info ─────────────────────────────────────────────────────────────
 
 async fn info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // CI stamps the release tag (e.g. "1.0.6") into LOCALCHAT_VERSION at
+    // build time via env! so the binary's reported version matches the
+    // GitHub release that produced it. Cargo.toml stays at "1.0.0" for
+    // local dev where the tag is unknown — in that case we fall back to
+    // CARGO_PKG_VERSION. Strip a leading "v" so the value compares cleanly
+    // against GitHub tag_names like "v1.0.6".
+    let version = option_env!("LOCALCHAT_VERSION")
+        .map(|v| v.trim_start_matches('v'))
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
     Json(json!({
         "addresses": crate::net::lan_addresses(),
         "hostname": hostname(),
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version,
         "server_id": state.server_id,
         "data_dir": state.app_root.display().to_string(),
         "uploads_dir": state.uploads_dir.display().to_string(),
