@@ -9,13 +9,6 @@ pub struct Config {
     #[serde(default)]
     pub port: u16,
 
-    /// Admin dashboard access token. Generated on first run.
-    pub admin_token: String,
-
-    /// If false (default), admin endpoints only accept requests from 127.0.0.1.
-    #[serde(default)]
-    pub allow_lan_admin: bool,
-
     /// Max upload size in MB.
     #[serde(default = "default_max_upload_mb")]
     pub max_upload_mb: u64,
@@ -53,8 +46,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 0,
-            admin_token: gen_token(),
-            allow_lan_admin: false,
             max_upload_mb: default_max_upload_mb(),
             history_ram: default_history_ram(),
             rotate_mb: default_rotate_mb(),
@@ -97,11 +88,3 @@ impl Config {
     }
 }
 
-fn gen_token() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-    (0..24)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
-        .collect()
-}

@@ -335,6 +335,13 @@ function onWelcome(e) {
 
   $("join").classList.add("hidden");
   $("app").classList.remove("hidden");
+  // Show admin link only when chat is opened on the host machine itself.
+  const adminLink = $("adminLink");
+  if (adminLink) {
+    const h = location.hostname;
+    const onHost = h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+    adminLink.hidden = !onHost;
+  }
   $("meChip").innerHTML = "";
   $("meChip").append(
     el("div", { class: "avatar xs", style: `background:${e.user.color}` }, e.user.avatar || "?"),

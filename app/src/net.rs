@@ -82,7 +82,7 @@ pub fn print_banner(port: u16, addrs: &[String], state: &std::sync::Arc<crate::s
     println!();
     println!("  📁  Data folder:     {}", state.app_root.display());
     println!("  📝  Log file:        {}", state.logs_dir.join("localchat.log").display());
-    println!("  🔑  Admin token:     {}", state.config.read().unwrap().admin_token);
+    println!("  �  Admin dashboard: https://localhost:{port}/admin  (host-only — not reachable from LAN)");
     println!();
     println!("  Share the LAN link above with people on the same Wi-Fi.");
     println!();

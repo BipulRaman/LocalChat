@@ -348,7 +348,10 @@ async fn serve_upload(
 
 // ── Embedded static assets (the web/ folder) ─────────────────────────
 
-async fn serve_asset(uri: Uri) -> impl IntoResponse {
+async fn serve_asset(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    uri: Uri,
+) -> impl IntoResponse {
     let mut p = uri.path().trim_start_matches('/').to_string();
     if p.is_empty() {
         p = "index.html".into();
@@ -356,6 +359,11 @@ async fn serve_asset(uri: Uri) -> impl IntoResponse {
     // Admin path convenience: /admin → admin.html
     if p == "admin" || p == "admin/" {
         p = "admin.html".into();
+    }
+    // The admin dashboard is host-only. Treat as 404 from any non-loopback
+    // address so its existence is not advertised on the LAN.
+    if (p == "admin.html" || p == "admin.js") && !addr.ip().is_loopback() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     match WebAssets::get(&p) {
         Some(content) => {

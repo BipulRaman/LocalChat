@@ -31,42 +31,25 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/logs", get(logs))
         .route("/restart", post(restart))
         .route("/shutdown", post(shutdown))
+        .route("/open-path", post(open_path))
 }
 
 // ── Authorization ────────────────────────────────────────────────────
 
+/// Admin endpoints are only reachable from the host machine itself.
+/// We rely on the client's source IP being a loopback address — there
+/// is no token and no way to opt-in to LAN access. Other devices on the
+/// network get a flat 403.
 async fn authorize(
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
+    _state: &Arc<AppState>,
+    _headers: &HeaderMap,
     addr: std::net::SocketAddr,
 ) -> Result<(), (StatusCode, String)> {
-    let cfg = state.config.read().unwrap();
-    if !cfg.allow_lan_admin && !addr.ip().is_loopback() {
-        return Err((StatusCode::FORBIDDEN, "admin API is localhost-only".into()));
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin is host-only".into()))
     }
-    let tok = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-token").and_then(|v| v.to_str().ok()));
-    match tok {
-        Some(t) if constant_time_eq(t.as_bytes(), cfg.admin_token.as_bytes()) => Ok(()),
-        _ => Err((StatusCode::UNAUTHORIZED, "bad token".into())),
-    }
-}
-
-/// Constant-time byte-slice comparison. Avoids leaking the admin token
-/// length / contents through response-time side channels when
-/// `allow_lan_admin` is enabled.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 macro_rules! auth {
@@ -144,7 +127,6 @@ async fn get_settings(
     let cfg = state.config.read().unwrap().clone();
     Ok(Json(json!({
         "port": cfg.port,
-        "allowLanAdmin": cfg.allow_lan_admin,
         "maxUploadMb": cfg.max_upload_mb,
         "historyRam": cfg.history_ram,
         "rotateMb": cfg.rotate_mb,
@@ -157,8 +139,6 @@ async fn get_settings(
 #[derive(Deserialize)]
 struct SettingsPatch {
     port: Option<u16>,
-    #[serde(rename = "allowLanAdmin")]
-    allow_lan_admin: Option<bool>,
     #[serde(rename = "maxUploadMb")]
     max_upload_mb: Option<u64>,
     #[serde(rename = "historyRam")]
@@ -178,9 +158,6 @@ async fn post_settings(
     let mut cfg = state.config.write().unwrap();
     if let Some(v) = patch.port {
         cfg.port = v;
-    }
-    if let Some(v) = patch.allow_lan_admin {
-        cfg.allow_lan_admin = v;
     }
     if let Some(v) = patch.max_upload_mb {
         cfg.max_upload_mb = v;
@@ -348,9 +325,15 @@ async fn list_uploads(
         while let Ok(Some(ent)) = rd.next_entry().await {
             if let Ok(m) = ent.metadata().await {
                 if m.is_file() {
+                    let modified = m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     out.push(json!({
                         "name": ent.file_name().to_string_lossy(),
                         "size": m.len(),
+                        "modified": modified,
                     }));
                 }
             }
@@ -523,6 +506,31 @@ async fn shutdown(
     spawn_self_and_exit(true);
     Ok(Json(json!({ "ok": true })))
 }
+
+/// Open one of the server's well-known directories in the host's file
+/// manager. Restricted to whitelisted keys so we never reveal an
+/// arbitrary filesystem path to the caller.
+async fn open_path(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<OpenPathReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    let path = match req.key.as_str() {
+        "data"    => state.app_root.clone(),
+        "uploads" => state.uploads_dir.clone(),
+        "logs"    => state.logs_dir.clone(),
+        "config"  => state.config_path.clone(),
+        _ => return Err((StatusCode::BAD_REQUEST, "unknown path key".into())),
+    };
+    opener::open(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open failed: {e}")))?;
+    Ok(Json(json!({ "ok": true, "path": path.display().to_string() })))
+}
+
+#[derive(Deserialize)]
+struct OpenPathReq { key: String }
 
 fn spawn_self_and_exit(shutdown_only: bool) {
     // Defer so the HTTP response has time to flush back to the browser.

@@ -13,7 +13,7 @@ use tray_icon::{
 
 use crate::state::AppState;
 
-pub fn run_event_loop(state: Arc<AppState>, port: u16) {
+pub fn run_event_loop(_state: Arc<AppState>, port: u16) {
     let event_loop = EventLoopBuilder::new().build();
 
     let menu = Menu::new();
@@ -72,8 +72,7 @@ pub fn run_event_loop(state: Arc<AppState>, port: u16) {
                     let _ = cb.set_text(lan_url.clone());
                 }
             } else if ev.id == open_admin_id {
-                let token = state.config.read().map(|c| c.admin_token.clone()).unwrap_or_default();
-                let url = format!("{local_url}/admin?token={}", url_safe(&token));
+                let url = format!("{local_url}/admin");
                 let _ = opener::open(&url);
             } else if ev.id == quit_id {
                 *control_flow = ControlFlow::Exit;
@@ -144,13 +143,4 @@ fn in_dot(x: i32, y: i32) -> bool {
         let (a, b) = (x - dx, y - dy);
         a * a + b * b <= 2
     })
-}
-
-fn url_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
-        })
-        .collect()
 }
