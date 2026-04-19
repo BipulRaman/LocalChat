@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
+use compact_str::ToCompactString;
 
 use crate::channel::ChannelRegistry;
 use crate::config::Config;
 use crate::message::ChannelId;
 use crate::metrics::Metrics;
-use crate::persist::{HistoryStore, ReactionLog};
+use crate::persist::{HistoryStore, JsonSnapshot, ReactionLog};
 use crate::user::{UserId, UserInfo};
 
 pub type ReactionKey = (ChannelId, u64);
@@ -25,10 +26,16 @@ pub struct AppState {
     pub config: RwLock<Config>,
     pub channels: ChannelRegistry,
     pub users: DashMap<UserId, UserInfo>,
-    /// Maps username → user_id so reloading the page reuses the same ID
-    /// (rather than incrementing the counter on every WS reconnect).
-    /// Lives for the life of the process.
+    /// Every user that has *ever* connected. Source of truth for the
+    /// persisted users.json. Mirrors `users` for currently-online ones.
+    pub known_users: DashMap<UserId, UserInfo>,
+    /// Maps username (lowercased) → user_id so the same person keeps the
+    /// same UserId across reloads AND server restarts. Snapshotted to disk.
     pub username_to_id: DashMap<compact_str::CompactString, UserId>,
+    /// Number of live WebSocket connections per user. >0 means "online".
+    /// Used so a refresh (open new socket before old one dies) doesn't
+    /// flap presence and never strips channel membership.
+    pub connections: DashMap<UserId, u32>,
     pub history: HistoryStore,
     pub metrics: Metrics,
 
@@ -36,6 +43,10 @@ pub struct AppState {
     /// Backed by `reaction_log` (append-only JSONL), replayed on startup.
     pub reactions: DashMap<ReactionKey, DashMap<EmojiKey, Vec<UserId>>>,
     pub reaction_log: ReactionLog,
+
+    /// Persistent JSON snapshots written atomically.
+    pub users_store: JsonSnapshot,
+    pub channels_store: JsonSnapshot,
 
     pub next_user_id: AtomicU32,
     pub next_msg_id: AtomicU64,
@@ -74,6 +85,33 @@ impl AppState {
         let reaction_log = ReactionLog::new(&app_root);
         let prior_reactions = reaction_log.load_all().await;
 
+        let users_store = JsonSnapshot::new(app_root.join("users.json"));
+        let channels_store = JsonSnapshot::new(app_root.join("channels.json"));
+
+        // Identity snapshot: { "next_id": u32, "users": [UserInfo...] }.
+        // We only persist enough to reuse the same UserId for the same
+        // username and recall their avatar/color/pubkey on next login.
+        #[derive(serde::Serialize, serde::Deserialize, Default)]
+        struct UsersSnapshot {
+            #[serde(default)]
+            next_id: u32,
+            #[serde(default)]
+            users: Vec<UserInfo>,
+        }
+        let snapshot: UsersSnapshot = users_store.load().await;
+        let prior_channels: Vec<crate::channel::ChannelMeta> =
+            channels_store.load().await;
+
+        let username_to_id: DashMap<compact_str::CompactString, UserId> = DashMap::new();
+        let known_users: DashMap<UserId, UserInfo> = DashMap::new();
+        for u in &snapshot.users {
+            username_to_id.insert(u.username.to_lowercase().to_compact_string(), u.id);
+            known_users.insert(u.id, u.clone());
+        }
+        let next_user_id = snapshot.next_id.max(
+            snapshot.users.iter().map(|u| u.id).max().unwrap_or(0) + 1,
+        ).max(1);
+
         let state = Arc::new(Self {
             app_root,
             uploads_dir,
@@ -82,15 +120,22 @@ impl AppState {
             config: RwLock::new(config),
             channels: ChannelRegistry::new(history_cap),
             users: DashMap::new(),
-            username_to_id: DashMap::new(),
+            known_users,
+            username_to_id,
+            connections: DashMap::new(),
             history: HistoryStore::new(history_dir, rotate_mb),
             metrics: Metrics::default(),
             reactions: DashMap::new(),
             reaction_log,
-            next_user_id: AtomicU32::new(1),
+            users_store,
+            channels_store,
+            next_user_id: AtomicU32::new(next_user_id),
             next_msg_id: AtomicU64::new(1),
             bound_port: AtomicU16::new(0),
         });
+
+        // Hydrate channel metadata (groups + DMs + their member sets).
+        state.channels.hydrate(prior_channels);
 
         // Replay reaction events into the in-memory map.
         for ev in prior_reactions {
@@ -120,23 +165,25 @@ impl AppState {
             }
         }
 
-        // Warm lobby history from disk so rejoins see prior messages.
-        if let Some(lobby) = state.channels.get(crate::channel::LOBBY_ID) {
-            let tail = state
-                .history
-                .tail(&lobby.id, state.channels.history_cap)
-                .await;
-            // Seed the in-RAM ring and bump next_msg_id past the max we saw.
-            let mut max_id = 0;
-            let mut ring = lobby.history.write().await;
-            for m in tail {
-                max_id = max_id.max(m.id);
-                ring.push_back(m);
+        // Warm history for every persistent channel (lobby + groups + DMs).
+        let mut max_id = 0u64;
+        let all_ids: Vec<crate::message::ChannelId> =
+            state.channels.map.iter().map(|e| e.value().id.clone()).collect();
+        for cid in all_ids {
+            if let Some(ch) = state.channels.get(&cid) {
+                let tail = state
+                    .history
+                    .tail(&ch.id, state.channels.history_cap)
+                    .await;
+                let mut ring = ch.history.write().await;
+                for m in tail {
+                    if m.id > max_id { max_id = m.id; }
+                    ring.push_back(m);
+                }
             }
-            drop(ring);
-            if max_id > 0 {
-                state.next_msg_id.store(max_id + 1, Ordering::Relaxed);
-            }
+        }
+        if max_id > 0 {
+            state.next_msg_id.store(max_id + 1, Ordering::Relaxed);
         }
 
         Ok(state)
@@ -148,6 +195,31 @@ impl AppState {
 
     pub fn next_user_id(&self) -> UserId {
         self.next_user_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Persist the channel registry (groups + DMs + member sets) to disk.
+    /// Cheap (a few hundred bytes per channel) and idempotent.
+    pub async fn save_channels(&self) {
+        let metas = self.channels.snapshot_for_disk();
+        self.channels_store.save(&metas).await;
+    }
+
+    /// Persist the identity table (username → UserId) plus per-user
+    /// avatar/color/pubkey so a returning user keeps the same id and look.
+    pub async fn save_users(&self) {
+        #[derive(serde::Serialize)]
+        struct UsersSnapshot {
+            next_id: u32,
+            users: Vec<UserInfo>,
+        }
+        let mut users: Vec<UserInfo> =
+            self.known_users.iter().map(|e| e.value().clone()).collect();
+        users.sort_by_key(|u| u.id);
+        let snap = UsersSnapshot {
+            next_id: self.next_user_id.load(Ordering::Relaxed),
+            users,
+        };
+        self.users_store.save(&snap).await;
     }
 }
 

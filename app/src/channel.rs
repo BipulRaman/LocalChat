@@ -22,7 +22,7 @@ pub enum ChannelKind {
     Dm,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMeta {
     pub id: ChannelId,
     pub kind: ChannelKind,
@@ -34,7 +34,7 @@ pub struct ChannelMeta {
     pub created_by: UserId,
     #[serde(rename = "createdAt")]
     pub created_at: u64,
-    #[serde(rename = "dmUsers", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dmUsers", default, skip_serializing_if = "Option::is_none")]
     pub dm_users: Option<[CompactString; 2]>,
 }
 
@@ -289,5 +289,38 @@ impl ChannelRegistry {
             })
             .map(|e| e.value().meta())
             .collect()
+    }
+
+    /// Snapshot every persistent channel (groups + DMs) for disk storage.
+    /// The lobby is recreated on each boot, so we skip it.
+    pub fn snapshot_for_disk(&self) -> Vec<ChannelMeta> {
+        self.map
+            .iter()
+            .filter(|e| !matches!(e.value().kind, ChannelKind::Lobby))
+            .map(|e| e.value().meta())
+            .collect()
+    }
+
+    /// Re-create channels (and their member sets) from a previous snapshot.
+    /// Skips the lobby (always present) and any duplicate ids.
+    pub fn hydrate(&self, metas: Vec<ChannelMeta>) {
+        for m in metas {
+            if matches!(m.kind, ChannelKind::Lobby) { continue; }
+            if self.map.contains_key(&m.id) { continue; }
+            let mut ch = Channel::new(
+                m.id.clone(),
+                m.kind,
+                m.name,
+                m.is_private,
+                m.created_by,
+                self.history_cap,
+            );
+            ch.dm_users = m.dm_users;
+            let ch = Arc::new(ch);
+            for uid in &m.members {
+                ch.members.insert(*uid);
+            }
+            self.map.insert(m.id.clone(), ch);
+        }
     }
 }

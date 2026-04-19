@@ -85,34 +85,67 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     }
 
     let user_id = assign_user_id(&state, &username);
+
+    // Restore previous identity (avatar/color/pubkey) if this user has
+    // connected before. Client-supplied values still win when provided.
+    let prior = state
+        .known_users
+        .get(&user_id)
+        .map(|e| e.value().clone());
+
+    let avatar = if !join.avatar.is_empty() {
+        join.avatar.chars().take(4).collect::<String>().to_compact_string()
+    } else if let Some(p) = prior.as_ref() {
+        p.avatar.clone()
+    } else {
+        username
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string())
+            .to_compact_string()
+    };
+    let color = if !join.color.is_empty() {
+        join.color.chars().take(16).collect::<String>().to_compact_string()
+    } else if let Some(p) = prior.as_ref() {
+        p.color.clone()
+    } else {
+        pick_color_for(&username).to_compact_string()
+    };
+    let pubkey = if !join.pubkey.is_empty() {
+        join.pubkey.chars().take(512).collect::<String>().to_compact_string()
+    } else {
+        prior.as_ref().map(|p| p.pubkey.clone()).unwrap_or_default()
+    };
+
     let info = UserInfo {
         id: user_id,
         username: username.clone(),
-        avatar: if join.avatar.is_empty() {
-            username
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "?".to_string())
-                .to_compact_string()
-        } else {
-            join.avatar.chars().take(4).collect::<String>().to_compact_string()
-        },
-        color: if join.color.is_empty() {
-            pick_color_for(&username).to_compact_string()
-        } else {
-            join.color.chars().take(16).collect::<String>().to_compact_string()
-        },
-        joined_at: now_secs(),
+        avatar,
+        color,
+        joined_at: prior.as_ref().map(|p| p.joined_at).unwrap_or_else(now_secs),
         ip: peer_ip.to_compact_string(),
-        msg_count: 0,
-        bytes_uploaded: 0,
-        pubkey: join.pubkey.chars().take(512).collect::<String>().to_compact_string(),
+        msg_count: prior.as_ref().map(|p| p.msg_count).unwrap_or(0),
+        bytes_uploaded: prior.as_ref().map(|p| p.bytes_uploaded).unwrap_or(0),
+        pubkey,
     };
     state.users.insert(user_id, info.clone());
+    state.known_users.insert(user_id, info.clone());
+    let was_offline = {
+        let mut entry = state.connections.entry(user_id).or_insert(0);
+        let prev = *entry;
+        *entry += 1;
+        prev == 0
+    };
     crate::applog::log(format_args!(
-        "join: user={} id={} ip={}", info.username, user_id, peer_ip
+        "join: user={} id={} ip={} (sockets={})",
+        info.username, user_id, peer_ip,
+        state.connections.get(&user_id).map(|e| *e).unwrap_or(0),
     ));
+
+    // Persist identity table so the same user keeps the same id across
+    // server restarts. Cheap and infrequent.
+    state.save_users().await;
 
     // Auto-join the lobby.
     let lobby = state.channels.get(LOBBY_ID).expect("lobby always exists");
@@ -123,11 +156,28 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     // page reloads (DMs are keyed by username hash, members are ephemeral).
     let rebound_dms = state.channels.rebind_user_dms(user_id, &info.username);
 
+    // Re-subscribe to every group channel this user is already a member
+    // of (membership is now durable across reloads & restarts).
+    let mut my_channels: Vec<CompactString> = Vec::new();
+    for entry in state.channels.map.iter() {
+        let ch = entry.value();
+        if matches!(ch.kind, ChannelKind::Lobby | ChannelKind::Dm) { continue; }
+        if ch.members.contains(&user_id) {
+            state.channels.add_user_channel(user_id, &ch.id);
+            my_channels.push(ch.id.clone());
+        }
+    }
+
     // Subscribe to all channels this user can see.
     let mut rxs: smallvec::SmallVec<[broadcast::Receiver<Arc<WireMsg>>; 8]> =
         smallvec::smallvec![];
     rxs.push(lobby.tx.subscribe());
     for cid in &rebound_dms {
+        if let Some(ch) = state.channels.get(cid) {
+            rxs.push(ch.tx.subscribe());
+        }
+    }
+    for cid in &my_channels {
         if let Some(ch) = state.channels.get(cid) {
             rxs.push(ch.tx.subscribe());
         }
@@ -149,14 +199,20 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
     // Send lobby recent history.
     send_history(&mut sink, &lobby, 50).await;
 
-    // Broadcast system "X joined" to lobby.
-    broadcast_system(&state, &lobby, &format!("{} joined the chat", info.username)).await;
-    broadcast_users(&state).await;
+    // Broadcast "X joined" only on the user's first concurrent socket.
+    if was_offline {
+        broadcast_system(&state, &lobby, &format!("{} joined the chat", info.username)).await;
+        broadcast_users(&state).await;
+    } else {
+        // Still refresh presence for *this* socket so its UI is correct.
+        broadcast_users(&state).await;
+    }
 
     // ---- Main loop: multiplex incoming ops and outgoing broadcasts.
     let mut own_channels: smallvec::SmallVec<[CompactString; 8]> =
         smallvec::smallvec![lobby.id.clone()];
     for cid in rebound_dms { own_channels.push(cid); }
+    for cid in my_channels { if !own_channels.iter().any(|c| c == &cid) { own_channels.push(cid); } }
 
     loop {
         tokio::select! {
@@ -204,6 +260,35 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
                             }
                             continue;
                         }
+                        // Intercept the __ch_invited control event: if it's
+                        // addressed to us, subscribe to the channel, surface
+                        // it in the sidebar, and tell the client to toast.
+                        if msg.username == "__ch_invited" {
+                            if let Ok(v) = serde_json::from_str::<Value>(&msg.text) {
+                                let target = v.get("forUserId").and_then(Value::as_u64).unwrap_or(0) as UserId;
+                                if target == user_id {
+                                    if let Some(ch_id) = v.get("channel").and_then(Value::as_str) {
+                                        let cid = ch_id.to_compact_string();
+                                        if let Some(ch) = state.channels.get(&cid) {
+                                            if !own_channels.iter().any(|c| c == &cid) {
+                                                rxs.push(ch.tx.subscribe());
+                                                own_channels.push(cid.clone());
+                                            }
+                                            let created = json!({"ev":"ch_created","channel":ch.meta()});
+                                            let _ = sink.send(Message::Text(created.to_string())).await;
+                                            let invited = json!({
+                                                "ev":"ch_invited",
+                                                "channel": ch.id,
+                                                "channelName": ch.name,
+                                                "inviter": v.get("inviter").and_then(Value::as_str).unwrap_or("")
+                                            });
+                                            let _ = sink.send(Message::Text(invited.to_string())).await;
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if sink.send(Message::Text(msg_to_json(&msg))).await.is_err() {
                             break;
                         }
@@ -219,14 +304,30 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String) {
 }
 
 async fn cleanup(state: &Arc<AppState>, user_id: UserId) {
+    // Decrement socket count; only fully "leave" when it hits zero.
+    let still_online = {
+        let mut entry = state.connections.entry(user_id).or_insert(0);
+        if *entry > 0 { *entry -= 1; }
+        let n = *entry;
+        if n == 0 { drop(entry); state.connections.remove(&user_id); false } else { true }
+    };
+    if still_online {
+        // Another tab/window is still open for this user. Keep presence
+        // and channel memberships intact.
+        state.metrics.dec_connect();
+        return;
+    }
+
     let removed = state.users.remove(&user_id).map(|(_, v)| v);
-    // Leave all channels (remove from members). Channels themselves stay.
-    if let Some((_, chs)) = state.channels.user_channels.remove(&user_id) {
-        for id in chs.iter() {
-            if let Some(ch) = state.channels.get(id) {
-                ch.members.remove(&user_id);
-            }
-        }
+    // We INTENTIONALLY do not strip the user from channel members here.
+    // Channel membership is durable; presence is reflected by `users`.
+    // Lobby is special — it's auto-joined on every connection, so we can
+    // drop it from user_channels to keep the per-user list trim.
+    if let Some(mut chs) = state.channels.user_channels.get_mut(&user_id) {
+        chs.retain(|c| c.as_str() != LOBBY_ID);
+    }
+    if let Some(lobby) = state.channels.get(LOBBY_ID) {
+        lobby.members.remove(&user_id);
     }
     state.metrics.dec_connect();
 
@@ -241,18 +342,18 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId) {
     }
 }
 
-/// Pick a UserId for this username. Reuses the previously assigned ID if
-/// the username has joined before in this process (so reloading the page
-/// doesn't keep bumping the counter). If a *currently online* user already
-/// holds that ID, we allocate a fresh one to avoid a collision.
+/// Pick a UserId for this username. Always reuses the previously assigned
+/// ID if the username has joined before — across reconnects AND across
+/// server restarts (loaded from users.json). Multiple concurrent sockets
+/// for the same username share the same UserId; the connection ref-count
+/// in `state.connections` decides when the user truly goes offline.
 fn assign_user_id(state: &Arc<AppState>, username: &CompactString) -> UserId {
-    if let Some(existing) = state.username_to_id.get(username).map(|v| *v) {
-        if !state.users.contains_key(&existing) {
-            return existing;
-        }
+    let key = username.to_lowercase().to_compact_string();
+    if let Some(existing) = state.username_to_id.get(&key).map(|v| *v) {
+        return existing;
     }
     let id = state.next_user_id();
-    state.username_to_id.insert(username.clone(), id);
+    state.username_to_id.insert(key, id);
     id
 }
 
@@ -544,6 +645,7 @@ async fn handle_op(
             let out = json!({"ev":"ch_created","channel":ch.meta()});
             let _ = sink.send(Message::Text(out.to_string())).await;
             broadcast_system(state, &ch, &format!("Channel #{} created", ch.name)).await;
+            state.save_channels().await;
         }
 
         "ch_join" => {
@@ -568,6 +670,7 @@ async fn handle_op(
                 .map(|u| u.value().username.to_string())
                 .unwrap_or_default();
             broadcast_system(state, &ch, &format!("{} joined #{}", username, ch.name)).await;
+            state.save_channels().await;
         }
 
         "ch_leave" => {
@@ -586,6 +689,7 @@ async fn handle_op(
                 // will drop the receiver when the channel empties or the
                 // socket closes. Correctness unaffected.
             }
+            state.save_channels().await;
         }
 
         "ch_invite" => {
@@ -601,12 +705,73 @@ async fn handle_op(
             if !ch.members.contains(&user_id) {
                 return Err("not a member".into());
             }
+            let inviter_name = state
+                .users
+                .get(&user_id)
+                .map(|u| u.value().username.to_string())
+                .unwrap_or_default();
+            let mut added: Vec<(UserId, String)> = Vec::new();
             for u in users {
                 if let Some(uid) = u.as_u64() {
                     let uid = uid as UserId;
-                    ch.members.insert(uid);
+                    if uid == user_id { continue; }
+                    let was_new = ch.members.insert(uid);
                     state.channels.add_user_channel(uid, &ch.id);
+                    if was_new {
+                        let name = state
+                            .users
+                            .get(&uid)
+                            .map(|u| u.value().username.to_string())
+                            .unwrap_or_default();
+                        added.push((uid, name));
+                    }
                 }
+            }
+            // Notify each invitee via the lobby control bus so their socket
+            // can subscribe to the new channel and surface a toast.
+            if !added.is_empty() {
+                if let Some(lobby) = state.channels.get(LOBBY_ID) {
+                    for (uid, _) in &added {
+                        let payload = json!({
+                            "ev": "ch_invited",
+                            "channel": ch.id,
+                            "forUserId": *uid,
+                            "inviter": inviter_name,
+                            "channelName": ch.name,
+                        });
+                        let _ = lobby.tx.send(Arc::new(WireMsg {
+                            id: 0,
+                            channel: lobby.id.clone(),
+                            kind: MsgKind::System,
+                            user_id,
+                            username: CompactString::const_new("__ch_invited"),
+                            avatar: CompactString::const_new(""),
+                            color: CompactString::const_new(""),
+                            ts: now_secs(),
+                            text: payload.to_string(),
+                            file: None,
+                            reply_to: None,
+                            edited_at: None,
+                            deleted: false,
+                        }));
+                    }
+                }
+                // Post a single system message in the channel announcing the additions.
+                let names: Vec<String> = added.iter().map(|(_, n)| n.clone()).filter(|s| !s.is_empty()).collect();
+                if !names.is_empty() {
+                    let joined = match names.len() {
+                        1 => names[0].clone(),
+                        2 => format!("{} and {}", names[0], names[1]),
+                        _ => {
+                            let last = names.last().cloned().unwrap_or_default();
+                            let head = &names[..names.len() - 1];
+                            format!("{}, and {}", head.join(", "), last)
+                        }
+                    };
+                    let text = format!("{} added {} to #{}", inviter_name, joined, ch.name);
+                    broadcast_system(state, &ch, &text).await;
+                }
+                state.save_channels().await;
             }
         }
 
@@ -656,6 +821,7 @@ async fn handle_op(
                     deleted: false,
                 }));
             }
+            state.save_channels().await;
         }
 
         "dm_delete" => {
@@ -694,6 +860,7 @@ async fn handle_op(
             let _ = sink
                 .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
                 .await;
+            state.save_channels().await;
         }
 
         "ch_delete" => {
@@ -730,6 +897,7 @@ async fn handle_op(
             let _ = sink
                 .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
                 .await;
+            state.save_channels().await;
         }
 
         "history" => {

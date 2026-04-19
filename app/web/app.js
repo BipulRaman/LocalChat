@@ -305,6 +305,7 @@ function handleEvent(e) {
     case "history":      return onHistory(e);
     case "react":        return onReact(e);
     case "ch_created":   return onChannelCreated(e.channel);
+    case "ch_invited":   return onChannelInvited(e);
     case "ch_deleted":   return onChannelDeleted(e.channel);
     case "error":        return onError(e);
     case "pong":         return;
@@ -529,6 +530,16 @@ function onChannelCreated(ch) {
   switchChannel(ch.id);
 }
 
+function onChannelInvited({ channel, channelName, inviter }) {
+  // Server already sent ch_created right before this, so the channel is
+  // in S.channels. Just surface a friendly toast — don't auto-switch
+  // (could be jarring mid-conversation).
+  const name = channelName || (S.channels.get(channel)?.name || channel);
+  const who = inviter ? `${inviter} added you to` : "You were added to";
+  toast(`${who} #${name}`);
+  renderChannels();
+}
+
 function onChannelDeleted(id) {
   S.channels.delete(id);
   S.msgs.delete(id);
@@ -583,7 +594,11 @@ function _sbGroup(key, title, count, items) {
 function _channelItem(c) {
   const active = c.id === S.active ? "active" : "";
   const unread = S.unread.get(c.id) || 0;
+  const isMember = !!(S.me && (c.members || []).includes(S.me.id));
   const canDelete = c.kind === "group" && S.me && c.createdBy === S.me.id;
+  // Creators delete (which removes for everyone). Other members can leave.
+  // Lobby can't be left or deleted.
+  const canLeave = c.kind === "group" && isMember && !canDelete;
   const askDelete = canDelete ? (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
@@ -593,10 +608,21 @@ function _channelItem(c) {
       okText: "Delete",
     }).then((ok) => { if (ok) deleteChannel(c.id); });
   } : null;
+  const askLeave = canLeave ? (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    confirmDialog({
+      title: "Leave channel",
+      body: c.isPrivate
+        ? `Leave private channel #${c.name || c.id}?\n\nYou'll need to be added back by a member to rejoin.`
+        : `Leave #${c.name || c.id}?\n\nYou can rejoin any time from the Channels list.`,
+      okText: "Leave",
+    }).then((ok) => { if (ok) leaveChannel(c.id); });
+  } : null;
   return el("li", {
     class: "chat-item " + active,
     onclick: () => switchChannel(c.id),
-    oncontextmenu: askDelete || undefined,
+    oncontextmenu: askDelete || askLeave || undefined,
   }, [
     el("div", { class: "avatar", style: `background:var(--brand)` }, "#"),
     el("div", { class: "chat-meta" }, [
@@ -612,11 +638,37 @@ function _channelItem(c) {
       onclick: askDelete,
       html: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>`,
     }) : null,
+    canLeave ? el("button", {
+      class: "chat-del",
+      title: `Leave #${c.name || c.id}`,
+      "aria-label": "Leave channel",
+      onclick: askLeave,
+      html: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/></svg>`,
+    }) : null,
   ]);
 }
 
 function deleteChannel(channelId) {
   sendOp({ op: "ch_delete", channel: channelId });
+}
+
+function leaveChannel(channelId) {
+  const ch = S.channels.get(channelId);
+  sendOp({ op: "ch_leave", channel: channelId });
+  // Optimistically remove ourselves locally so the sidebar updates and
+  // the active view falls back to lobby if needed.
+  if (ch && S.me) {
+    ch.members = (ch.members || []).filter((id) => id !== S.me.id);
+  }
+  if (S.active === channelId) {
+    const fallback = S.lobby || [...S.channels.keys()][0];
+    if (fallback) switchChannel(fallback);
+  }
+  if (ch) S.channels.delete(channelId);
+  S.msgs.delete(channelId);
+  S.unread.delete(channelId);
+  renderChannels();
+  toast(`Left #${ch?.name || channelId}`);
 }
 
 function _dmItem(c) {
@@ -771,6 +823,7 @@ function renderChannels() {
 }
 
 function setSidebarTab(tab) {
+  if (tab === "all") tab = "mine";
   S.sidebarTab = tab;
   document.querySelectorAll(".sb-tab").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === tab);
@@ -1092,7 +1145,16 @@ function updateHeader() {
   const avSlot = $("chAvatar");
   const callBtn = $("callBtn");
   const videoCallBtn = $("videoCallBtn");
+  const joinBtn = $("joinBtn");
+  const addPeopleBtn = $("addPeopleBtn");
   if (!ch) return;
+
+  // "Join" appears for public groups the current user isn't already a member of.
+  const isMember = !!(S.me && (ch.members || []).includes(S.me.id));
+  if (joinBtn) joinBtn.classList.toggle("hidden", !(ch.kind === "group" && !ch.isPrivate && !isMember));
+  // "Add people" appears for any group channel you're already a member of.
+  // For private channels this is the ONLY way for new people to get in.
+  if (addPeopleBtn) addPeopleBtn.classList.toggle("hidden", !(ch.kind === "group" && isMember));
 
   if (ch.kind === "dm") {
     const p = dmPeer(ch);
@@ -1295,6 +1357,39 @@ function openCreateChannel() {
 }
 function closeModal(id) { $(id).classList.add("hidden"); }
 
+// ── Sidebar "+" menu (new channel / new DM) ─────────────────────────
+function toggleNewMenu(ev) {
+  if (ev) ev.stopPropagation();
+  const menu = $("sbNewMenu");
+  const btn = $("sbNewBtn");
+  if (!menu || !btn) return;
+  const willOpen = menu.classList.contains("hidden");
+  menu.classList.toggle("hidden", !willOpen);
+  btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+  if (willOpen) {
+    document.addEventListener("click", _newMenuOutside, true);
+    document.addEventListener("keydown", _newMenuKey, true);
+  } else {
+    closeNewMenu();
+  }
+}
+function closeNewMenu() {
+  const menu = $("sbNewMenu");
+  const btn = $("sbNewBtn");
+  if (menu) menu.classList.add("hidden");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  document.removeEventListener("click", _newMenuOutside, true);
+  document.removeEventListener("keydown", _newMenuKey, true);
+}
+function _newMenuOutside(e) {
+  const menu = $("sbNewMenu"); const btn = $("sbNewBtn");
+  if (!menu || menu.classList.contains("hidden")) return;
+  if (menu.contains(e.target) || (btn && btn.contains(e.target))) return;
+  closeNewMenu();
+}
+function _newMenuKey(e) { if (e.key === "Escape") closeNewMenu(); }
+Object.assign(window, { toggleNewMenu, closeNewMenu });
+
 // ── Confirm dialog (returns Promise<boolean>) ────────────────────────
 let _cfResolve = null;
 function confirmDialog({ title = "Confirm", body = "", okText = "Delete", okClass = "btn-danger", cancelText = "Cancel" } = {}) {
@@ -1389,6 +1484,96 @@ function openDmPicker() {
   }
   $("dmModal").classList.remove("hidden");
 }
+
+// ── Self-join a public group channel ────────────────────────────────
+function joinCurrentChannel() {
+  const ch = S.channels.get(S.active);
+  if (!ch || ch.kind !== "group" || ch.isPrivate) return;
+  if (S.me && (ch.members || []).includes(S.me.id)) return;
+  sendOp({ op: "ch_join", channel: ch.id });
+  // Optimistically reflect membership so the Join button hides immediately.
+  if (S.me) {
+    ch.members = ch.members || [];
+    if (!ch.members.includes(S.me.id)) ch.members.push(S.me.id);
+  }
+  toast(`Joined #${ch.name || ch.id}`);
+  updateHeader();
+  renderMembers();
+}
+
+Object.assign(window, { joinCurrentChannel });
+
+// ── Add people to a group channel (works for public + private) ──────
+const _inv = { selected: new Set() };
+function openInviteModal() {
+  const ch = S.channels.get(S.active);
+  if (!ch || ch.kind !== "group") return;
+  if (!S.me || !(ch.members || []).includes(S.me.id)) return;
+  _inv.selected.clear();
+  const sub = $("invSub");
+  if (sub) sub.textContent = ch.isPrivate
+    ? `Add people to private channel #${ch.name || ch.id}. Only members can see it.`
+    : `Add people to #${ch.name || ch.id}.`;
+  $("invSearch").value = "";
+  renderInviteList();
+  $("inviteModal").classList.remove("hidden");
+  setTimeout(() => $("invSearch").focus(), 0);
+}
+
+function renderInviteList() {
+  const ch = S.channels.get(S.active);
+  if (!ch) return;
+  const list = $("invList");
+  const q = ($("invSearch").value || "").trim().toLowerCase();
+  const members = new Set(ch.members || []);
+  const candidates = [...S.users.values()]
+    .filter((u) => u.id !== S.me?.id && !members.has(u.id))
+    .filter((u) => !q || (u.username || "").toLowerCase().includes(q))
+    .sort((a, b) => a.username.localeCompare(b.username));
+  list.innerHTML = "";
+  if (!candidates.length) {
+    list.append(el("li", { class: "muted sm" },
+      q ? "No one matches your search." : "Everyone online is already a member."));
+  }
+  for (const u of candidates) {
+    const checked = _inv.selected.has(u.id);
+    const li = el("li", {
+      class: "inv-item" + (checked ? " checked" : ""),
+      onclick: () => {
+        if (_inv.selected.has(u.id)) _inv.selected.delete(u.id);
+        else _inv.selected.add(u.id);
+        renderInviteList();
+      },
+    }, [
+      el("div", { class: "avatar xs", style: `background:${u.color}` },
+        u.avatar || (u.username?.[0] || "?").toUpperCase()),
+      el("span", { class: "inv-name" }, u.username),
+      el("span", { class: "inv-check", "aria-hidden": "true" }, checked ? "✓" : ""),
+    ]);
+    list.append(li);
+  }
+  const n = _inv.selected.size;
+  $("invCount").textContent = `${n} selected`;
+  $("invSendBtn").disabled = n === 0;
+  $("invSendBtn").textContent = n > 0 ? `Add ${n}` : "Add";
+}
+
+function sendInvites() {
+  const ch = S.channels.get(S.active);
+  if (!ch) return;
+  const ids = [..._inv.selected];
+  if (!ids.length) return;
+  sendOp({ op: "ch_invite", channel: ch.id, users: ids });
+  // Optimistically reflect new members so the picker / list updates.
+  ch.members = ch.members || [];
+  for (const id of ids) if (!ch.members.includes(id)) ch.members.push(id);
+  toast(`Added ${ids.length} to #${ch.name || ch.id}`);
+  closeModal("inviteModal");
+  updateHeader();
+  renderMembers();
+}
+
+Object.assign(window, { openInviteModal, renderInviteList, sendInvites });
 
 function toggleSidebar() { $("sidebar").classList.toggle("open"); }
 // Auto-close mobile sidebar on outside tap / Escape.

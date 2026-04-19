@@ -156,3 +156,48 @@ impl ReactionLog {
         out
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Generic small JSON snapshot (atomic write via tmp + rename).
+// Used for users.json and channels.json — small, mutated infrequently,
+// and read entirely on startup.
+// ──────────────────────────────────────────────────────────────────────
+
+pub struct JsonSnapshot {
+    pub path: PathBuf,
+    pub write_lock: Mutex<()>,
+}
+
+impl JsonSnapshot {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, write_lock: Mutex::new(()) }
+    }
+
+    pub async fn load<T: serde::de::DeserializeOwned + Default>(&self) -> T {
+        match tokio::fs::read(&self.path).await {
+            Ok(bytes) if !bytes.is_empty() => {
+                serde_json::from_slice::<T>(&bytes).unwrap_or_default()
+            }
+            _ => T::default(),
+        }
+    }
+
+    pub async fn save<T: serde::Serialize>(&self, value: &T) {
+        let _g = self.write_lock.lock().await;
+        let Ok(bytes) = serde_json::to_vec_pretty(value) else { return };
+        let tmp = self.path.with_extension("json.tmp");
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .await
+        {
+            if f.write_all(&bytes).await.is_ok() {
+                let _ = f.flush().await;
+                drop(f);
+                let _ = tokio::fs::rename(&tmp, &self.path).await;
+            }
+        }
+    }
+}
