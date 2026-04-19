@@ -138,6 +138,7 @@ async fn info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "addresses": crate::net::lan_addresses(),
         "hostname": hostname(),
         "version": env!("CARGO_PKG_VERSION"),
+        "server_id": state.server_id,
         "data_dir": state.app_root.display().to_string(),
         "uploads_dir": state.uploads_dir.display().to_string(),
         "logs_dir": state.logs_dir.display().to_string(),

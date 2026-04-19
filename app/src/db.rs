@@ -183,11 +183,15 @@ pub struct Db {
 
 impl Db {
     /// Open (or create) `<app_root>/localchat.db`, apply pragmas, and run
-    /// the schema. Idempotent — safe to call on every boot.
-    pub async fn open(app_root: &Path) -> rusqlite::Result<Self> {
+    /// the schema. Idempotent — safe to call on every boot. Returns
+    /// `(db, server_id)` where `server_id` is a stable UUID stamped into
+    /// `schema_meta` on first creation. The id never changes for the
+    /// lifetime of this DB file, so clients can use it to namespace
+    /// per-server localStorage.
+    pub async fn open(app_root: &Path) -> rusqlite::Result<(Self, String)> {
         let path = app_root.join("localchat.db");
         let p = path.clone();
-        let conn = tokio::task::spawn_blocking(move || -> rusqlite::Result<Connection> {
+        let (conn, server_id) = tokio::task::spawn_blocking(move || -> rusqlite::Result<(Connection, String)> {
             let conn = Connection::open(&p)?;
             // Pragmas applied in the order rusqlite recommends.
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -211,12 +215,34 @@ impl Db {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![SCHEMA_VERSION.to_string()],
             )?;
-            Ok(conn)
+            // Stamp a stable server id on first creation. Used by the
+            // browser client to namespace localStorage so settings from
+            // a different LocalChat database / install never bleed in.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key='server_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let server_id = match existing {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO schema_meta(key,value) VALUES('server_id', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![new_id],
+                    )?;
+                    new_id
+                }
+            };
+            Ok((conn, server_id))
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
 
-        Ok(Self { inner: Arc::new(Mutex::new(conn)), path })
+        Ok((Self { inner: Arc::new(Mutex::new(conn)), path }, server_id))
     }
 
     /// Run a closure with the locked connection on a blocking thread.

@@ -56,6 +56,11 @@ pub struct AppState {
 
     pub db: Db,
 
+    /// Stable per-database UUID stamped at first DB creation. Returned
+    /// in `/api/info` so the browser client can namespace localStorage
+    /// per-server (different DB ⇒ different bucket ⇒ no stale settings).
+    pub server_id: String,
+
     /// Per-WS session tokens → user_id. Issued in the WS join op so
     /// HTTP endpoints (uploads) can identify the user without a
     /// separate cookie-based auth layer. Tokens live as long as the
@@ -89,7 +94,32 @@ impl AppState {
         let logs_dir    = app_root.join("logs");
         let config_path = app_root.join("config.json");
 
-        let _ = std::fs::create_dir_all(&app_root);
+        // Probe for writability BEFORE touching SQLite / TLS / config.
+        // If Windows Defender "Controlled Folder Access" or ordinary
+        // NTFS ACLs block writes here, every later operation would
+        // silently fail — so we fail loudly right now with a copy-
+        // pasteable remediation command.
+        if let Err(e) = verify_writable(&app_root) {
+            eprintln!();
+            eprintln!("  ❌  LocalChat cannot write to its data folder:");
+            eprintln!("        {}", app_root.display());
+            eprintln!("        error: {e}");
+            eprintln!();
+            eprintln!("  Likely cause: Windows Defender 'Controlled Folder");
+            eprintln!("  Access' (ransomware protection) is blocking this exe.");
+            eprintln!();
+            eprintln!("  Fix (run PowerShell as Administrator):");
+            if let Ok(exe) = std::env::current_exe() {
+                eprintln!("    Add-MpPreference -ControlledFolderAccessAllowedApplications '{}'", exe.display());
+            }
+            eprintln!();
+            eprintln!("  Or pick a different folder by deleting the pointer file");
+            eprintln!("  next to the exe (localchat.datadir) and restarting, or");
+            eprintln!("  set the LOCALCHAT_HOME environment variable.");
+            eprintln!();
+            return Err(e);
+        }
+
         let _ = std::fs::create_dir_all(&uploads_dir);
         let _ = std::fs::create_dir_all(&logs_dir);
 
@@ -99,10 +129,10 @@ impl AppState {
         crate::applog::init(&logs_dir);
         crate::applog::log(format_args!("bootstrap: app_root={}", app_root.display()));
 
-        let db = Db::open(&app_root)
+        let (db, server_id) = Db::open(&app_root)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        crate::applog::log(format_args!("bootstrap: db ready at {}", db.path.display()));
+        crate::applog::log(format_args!("bootstrap: db ready at {} (server_id={})", db.path.display(), server_id));
 
         let known: Vec<UserInfo> = db.list_users().await.unwrap_or_default();
         let username_to_id: DashMap<compact_str::CompactString, UserId> = DashMap::new();
@@ -172,6 +202,7 @@ impl AppState {
             reactions,
             calls: DashMap::new(),
             db,
+            server_id,
             sessions: DashMap::new(),
             next_user_id: AtomicU32::new(next_user_id),
             next_msg_id: AtomicU64::new(next_msg),
@@ -197,26 +228,321 @@ impl AppState {
 }
 
 fn resolve_app_root() -> PathBuf {
-    // Explicit override wins.
+    // 1. Explicit override (used by installers, tests, renames).
     if let Ok(p) = std::env::var("LOCALCHAT_HOME") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    // Prefer a folder next to the running exe. This avoids Windows
-    // "Controlled Folder Access" (ransomware protection) blocking
-    // writes into %APPDATA% for un-whitelisted binaries during
-    // development, which otherwise silently drops DB inserts and
-    // file uploads.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.join("localchat-data");
+
+    // 2. Pointer file next to the exe. Written on first run after the
+    //    interactive prompt so subsequent boots skip it. Users can
+    //    delete the pointer file to re-trigger the prompt, or edit it
+    //    to point at a different data directory.
+    let pointer = pointer_file_path();
+    if let Some(ref path) = pointer {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            let trimmed = txt.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
         }
     }
-    if let Some(d) = dirs::data_dir() {
-        return d.join("LocalChat");
+
+    // 3. First-run setup via the user's web browser. We spin up a
+    //    tiny localhost HTTP server on an ephemeral port, open the
+    //    default browser at it, and wait for the user to submit the
+    //    folder picker form. Default is a clean top-level folder NOT
+    //    covered by Windows Defender "Controlled Folder Access".
+    let default = default_data_dir();
+    let chosen = prompt_via_browser(&default);
+
+    // Persist the choice so we don't ask again.
+    if let Some(ref p) = pointer {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, chosen.to_string_lossy().as_bytes());
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("localchat-data")
+
+    chosen
+}
+
+fn default_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        // C:\LocalChat — not protected by Controlled Folder Access,
+        // writable by the current user after `mkdir`, and easy to
+        // find/back-up/wipe.
+        PathBuf::from(r"C:\LocalChat")
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = dirs::home_dir() {
+            home.join("LocalChat")
+        } else {
+            PathBuf::from("./LocalChat")
+        }
+    }
+}
+
+/// Where we store the "which data dir did the user pick" pointer.
+/// Next to the exe so it travels with the binary; falls back to cwd.
+fn pointer_file_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return Some(parent.join("localchat.datadir"));
+        }
+    }
+    Some(std::env::current_dir().ok()?.join("localchat.datadir"))
+}
+
+/// First-run setup via a localhost web page. Binds an ephemeral port,
+/// opens the user's default browser, and serves a simple form. Returns
+/// the path the user picks (or `default` if the browser flow fails for
+/// any reason — e.g. headless / no browser / port bind error). Blocks
+/// until the form is submitted, so the rest of bootstrap waits.
+fn prompt_via_browser(default: &std::path::Path) -> PathBuf {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("first-run setup: cannot bind localhost setup port ({e}); using default {}", default.display());
+            return default.to_path_buf();
+        }
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let url = format!("http://127.0.0.1:{port}/");
+
+    eprintln!();
+    eprintln!("  ┌───────────────────────────────────────────────────────────┐");
+    eprintln!("  │  LocalChat — first-run setup                              │");
+    eprintln!("  └───────────────────────────────────────────────────────────┘");
+    eprintln!();
+    eprintln!("  Opening your browser to choose a data folder…");
+    eprintln!("  If it doesn't open, visit:  {url}");
+    eprintln!();
+
+    // Try to launch the user's default browser. Failure is non-fatal —
+    // the URL is printed above so they can paste it manually.
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+
+    let default_attr = html_escape(&default.to_string_lossy());
+    let form_html = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>LocalChat — first-run setup</title>
+<style>
+  body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:580px;margin:60px auto;padding:0 24px;color:#1f2937;background:#f9fafb;}}
+  h1{{font-size:22px;margin:0 0 4px;}}
+  p{{color:#4b5563;line-height:1.55;}}
+  label{{display:block;margin-top:18px;font-weight:600;font-size:14px;}}
+  input[type=text]{{width:100%;padding:11px 12px;font:inherit;border:1px solid #d1d5db;border-radius:8px;box-sizing:border-box;background:#fff;}}
+  input[type=text]:focus{{outline:none;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.18);}}
+  button{{margin-top:16px;padding:11px 22px;font:inherit;font-weight:600;background:#2563eb;color:#fff;border:0;border-radius:8px;cursor:pointer;}}
+  button:hover{{background:#1d4ed8;}}
+  .note{{font-size:13px;color:#6b7280;margin-top:6px;}}
+  .warn{{font-size:13px;color:#92400e;background:#fef3c7;padding:10px 12px;border-radius:8px;margin-top:18px;}}
+</style></head><body>
+<h1>LocalChat — first-run setup</h1>
+<p>Pick a folder where LocalChat will keep its database, uploads, logs, and TLS certificate. You can change this later by editing <code>localchat.datadir</code> next to the executable.</p>
+<form method="POST" action="/setup">
+  <label for="path">Data folder</label>
+  <input id="path" name="path" type="text" value="{default_attr}" autofocus spellcheck="false">
+  <p class="note">Press <b>Continue</b> to use this folder, or edit the path first.</p>
+  <div class="warn">⚠ Avoid OneDrive, Documents, Desktop, and <code>%APPDATA%</code>. Windows Defender's "Controlled Folder Access" can silently block writes there.</div>
+  <button type="submit">Continue</button>
+</form>
+</body></html>"#
+    );
+
+    loop {
+        let (mut stream, _) = match listener.accept() {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+
+        // Read request headers (and any body bytes that came with them).
+        let mut buf = Vec::with_capacity(2048);
+        let mut tmp = [0u8; 2048];
+        let mut header_end = None;
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let header_end = match header_end {
+            Some(p) => p,
+            None => {
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
+        };
+
+        let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let mut header_lines = header_str.split("\r\n");
+        let request_line = header_lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path_part = parts.next().unwrap_or("");
+
+        if method == "GET" && (path_part == "/" || path_part.starts_with("/?") || path_part == "/index.html") {
+            let body = form_html.as_bytes();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+            continue;
+        }
+
+        if method == "POST" && path_part == "/setup" {
+            // Pull Content-Length from headers.
+            let mut content_length: usize = 0;
+            for line in header_lines {
+                let lower = line.to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("content-length:") {
+                    content_length = rest.trim().parse().unwrap_or(0);
+                    break;
+                }
+            }
+
+            // Body bytes already read with headers.
+            let mut body: Vec<u8> = buf[header_end..].to_vec();
+            while body.len() < content_length && body.len() < 64 * 1024 {
+                let mut more = [0u8; 2048];
+                match stream.read(&mut more) {
+                    Ok(0) => break,
+                    Ok(n) => body.extend_from_slice(&more[..n]),
+                    Err(_) => break,
+                }
+            }
+            let body_str = String::from_utf8_lossy(&body).to_string();
+
+            let mut chosen = default.to_path_buf();
+            for kv in body_str.split('&') {
+                let mut it = kv.splitn(2, '=');
+                let k = it.next().unwrap_or("");
+                let v = it.next().unwrap_or("");
+                if k == "path" {
+                    let decoded = url_decode(v);
+                    let trimmed = decoded.trim();
+                    if !trimmed.is_empty() {
+                        chosen = PathBuf::from(trimmed);
+                    }
+                    break;
+                }
+            }
+
+            let chosen_disp = html_escape(&chosen.to_string_lossy());
+            let ok_html = format!(
+                r#"<!doctype html><html><head><meta charset="utf-8"><title>LocalChat ready</title>
+<style>body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:580px;margin:60px auto;padding:0 24px;color:#1f2937;background:#f9fafb;}}
+h1{{font-size:22px;}} pre{{background:#fff;border:1px solid #e5e7eb;padding:12px 14px;border-radius:8px;overflow:auto;}}
+p{{color:#4b5563;line-height:1.55;}}</style></head><body>
+<h1>✅ Setup complete</h1>
+<p>LocalChat will store its data in:</p>
+<pre>{chosen_disp}</pre>
+<p>You can close this tab. The server is starting on <code>https://localhost</code>.</p>
+</body></html>"#
+            );
+            let body_b = ok_html.as_bytes();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_b.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body_b);
+            let _ = stream.flush();
+            // Give the browser a beat to actually receive the response
+            // before the listener is dropped.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            return chosen;
+        }
+
+        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &s[i + 1..i + 3];
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                } else {
+                    out.push(b'%');
+                }
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Make sure the chosen data directory is actually writable before we
+/// start touching SQLite / TLS / uploads. Prints a clear, actionable
+/// error on failure (including the exact Defender whitelist command)
+/// and exits. This turns an invisible permission-denied into a loud
+/// boot error instead of silent write failures at runtime.
+pub fn verify_writable(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".localchat-write-probe");
+    std::fs::write(&probe, b"ok")?;
+    std::fs::remove_file(&probe)?;
+    Ok(())
 }

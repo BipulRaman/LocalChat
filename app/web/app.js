@@ -87,6 +87,91 @@ function toast(msg, ms = 2500) {
   toast._t = setTimeout(() => t.classList.add("hidden"), ms);
 }
 
+// ── Per-server localStorage namespace ────────────────────────────────
+// Every LocalChat database stamps a stable `server_id` (UUID) at first
+// creation and returns it from /api/info. We keep ONE localStorage
+// entry per server, keyed by that id, whose value is a JSON blob of
+// every client-side setting. This means:
+//   - different LocalChat networks never see each other's state
+//   - wiping a server's data folder gives clients a clean bucket
+//     (the new DB stamps a fresh id → a new, empty key)
+//   - settings are trivially inspectable / removable per network
+//
+// Wire format in window.localStorage:
+//   "localchat:<server_id>" -> JSON.stringify({
+//       "username": "...",
+//       "e2ee-kp":  "...",
+//       "outbox:v1": "[...]",
+//       ...
+//   })
+//
+// Reads before bootServerId() resolves use a transient in-memory bucket
+// so nothing is ever written to the wrong namespace.
+const _STORE_PREFIX = "localchat:";
+let _storeReady = false;
+let _storeKey = null;           // full localStorage key for current server
+const _pendingStore = {};       // pre-boot writes, replayed once known
+let _bucketCache = null;        // last-read bucket for the current server
+
+function _readBucket() {
+  if (!_storeReady) return _pendingStore;
+  if (_bucketCache) return _bucketCache;
+  try {
+    _bucketCache = JSON.parse(localStorage.getItem(_storeKey) || "{}") || {};
+  } catch {
+    _bucketCache = {};
+  }
+  return _bucketCache;
+}
+function _writeBucket() {
+  if (!_storeReady || !_bucketCache) return;
+  try { localStorage.setItem(_storeKey, JSON.stringify(_bucketCache)); } catch {}
+}
+const lstore = {
+  get(key) {
+    const b = _readBucket();
+    return Object.prototype.hasOwnProperty.call(b, key) ? b[key] : null;
+  },
+  set(key, value) {
+    if (!_storeReady) { _pendingStore[key] = String(value); return; }
+    const b = _readBucket();
+    b[key] = String(value);
+    _writeBucket();
+  },
+  remove(key) {
+    if (!_storeReady) { delete _pendingStore[key]; return; }
+    const b = _readBucket();
+    if (!(key in b)) return;
+    delete b[key];
+    _writeBucket();
+  },
+  // Remove every other LocalChat server bucket from this device. Useful
+  // for a "forget other networks" admin button later; not called
+  // automatically.
+  pruneOthers() {
+    if (!_storeReady) return;
+    const drop = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(_STORE_PREFIX) && k !== _storeKey) drop.push(k);
+    }
+    for (const k of drop) localStorage.removeItem(k);
+  },
+};
+function bindServerId(id) {
+  if (!id) return;
+  _storeKey = _STORE_PREFIX + String(id);
+  _storeReady = true;
+  _bucketCache = null;
+  // Replay any writes that happened before /api/info responded.
+  if (Object.keys(_pendingStore).length) {
+    const b = _readBucket();
+    Object.assign(b, _pendingStore);
+    _writeBucket();
+    for (const k of Object.keys(_pendingStore)) delete _pendingStore[k];
+  }
+}
+
 // ── E2EE (Web Crypto) ────────────────────────────────────────────────
 // Model: each browser has a persistent ECDH P-256 keypair stored in
 // localStorage. Public key (JWK) is sent to server in the `join` op and
@@ -112,7 +197,7 @@ const E2EE = {
       return;
     }
     this.available = true;
-    const stored = localStorage.getItem("localchat-e2ee-kp");
+    const stored = lstore.get("e2ee-kp");
     if (stored) {
       try {
         const { privJwk, pubJwk } = JSON.parse(stored);
@@ -127,7 +212,7 @@ const E2EE = {
     const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
     const privJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
     const pubJwk  = await crypto.subtle.exportKey("jwk", kp.publicKey);
-    localStorage.setItem("localchat-e2ee-kp", JSON.stringify({ privJwk, pubJwk }));
+    lstore.set("e2ee-kp", JSON.stringify({ privJwk, pubJwk }));
     this.kp = { privateKey: kp.privateKey, publicKey: kp.publicKey, publicJwk: pubJwk };
   },
 
@@ -273,6 +358,18 @@ const S = {
 
 // ── Boot ─────────────────────────────────────────────────────────────
 (async function boot() {
+  // Resolve which server we're talking to BEFORE touching localStorage,
+  // so every read/write lands in the per-server bucket. Falls back to
+  // a synthetic id derived from the page origin if /api/info fails —
+  // still better than collapsing every server into one global bucket.
+  try {
+    const info = await fetch("/api/info").then((r) => r.json());
+    bindServerId(info && info.server_id ? info.server_id : `origin:${location.host}`);
+    S.hostname = (info && info.hostname) || "";
+  } catch {
+    bindServerId(`origin:${location.host}`);
+  }
+
   try { await E2EE.init(); } catch (e) { console.warn("E2EE init failed", e); }
 
   // Refresh speaker/headset icon when audio devices change (plug/unplug).
@@ -286,12 +383,9 @@ const S = {
   // visualViewport-driven `--vv-h`, but that fought Android Chrome's
   // own scroll-into-view behaviour and left the composer stranded mid-
   // viewport. `dvh` is simpler and more reliable.
-  fetch("/api/info").then((r) => r.json()).then((info) => {
-    S.hostname = info.hostname || "";
-  }).catch(() => {});
 
   // Auto-rejoin if we previously chose a username on this device.
-  const saved = localStorage.getItem("localchat-username");
+  const saved = lstore.get("username");
   if (saved) {
     $("username").value = saved;
     connect(saved);
@@ -303,7 +397,7 @@ $("joinForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const username = $("username").value.trim();
   if (!username) return;
-  localStorage.setItem("localchat-username", username);
+  lstore.set("username", username);
   connect(username);
 });
 
@@ -377,7 +471,7 @@ function handleEvent(e) {
 // the natural reconnect loop bring up the join screen.
 function onKicked(e) {
   const reason = (e && e.text) || (e && e.reason) || "removed by administrator";
-  try { localStorage.removeItem("localchat-username"); } catch {}
+  try { lstore.remove("username"); } catch {}
   S.me = null;
   setStatus("warn", "Kicked");
   if (typeof toast === "function") toast("Disconnected: " + reason);
@@ -391,7 +485,7 @@ function onError(e) {
     // Server rejected our auto-join (banned, bad name, name taken, etc.).
     // Drop the saved name so the user can pick a different one, surface
     // the message in the join screen, and stop the reconnect loop.
-    localStorage.removeItem("localchat-username");
+    lstore.remove("username");
     const status = $("joinStatus");
     if (status) {
       status.textContent = e.text || "Could not join.";
@@ -669,16 +763,14 @@ function onTyping({ channel, userId, username, typing }) {
 // Collapsed state for sidebar groups, persisted across reloads.
 // Key bumped to v2 so any previously-collapsed groups reopen on first
 // load after the upgrade — sections start fully expanded by default.
-const SB_COLLAPSE_KEY = "localchat-sb-collapsed-v2";
+const SB_COLLAPSE_KEY = "sb-collapsed-v2";
 const _sbCollapsed = (() => {
-  try { return new Set(JSON.parse(localStorage.getItem(SB_COLLAPSE_KEY) || "[]")); }
+  try { return new Set(JSON.parse(lstore.get(SB_COLLAPSE_KEY) || "[]")); }
   catch { return new Set(); }
 })();
-// One-time cleanup of the v1 key so it doesn't keep haunting localStorage.
-try { localStorage.removeItem("localchat-sb-collapsed"); } catch {}
 function _sbToggle(key, open) {
   if (open) _sbCollapsed.delete(key); else _sbCollapsed.add(key);
-  localStorage.setItem(SB_COLLAPSE_KEY, JSON.stringify([..._sbCollapsed]));
+  lstore.set(SB_COLLAPSE_KEY, JSON.stringify([..._sbCollapsed]));
 }
 
 function _sbGroup(key, title, count, items) {
@@ -1536,13 +1628,13 @@ function sendOp(obj) {
 //
 // Persisted to localStorage so a page refresh during an in-flight
 // upload still posts the file message once we reconnect.
-const _OUTBOX_KEY = "lc:outbox:v1";
+const _OUTBOX_KEY = "outbox:v1";
 function _loadOutbox() {
-  try { return JSON.parse(localStorage.getItem(_OUTBOX_KEY) || "[]"); }
+  try { return JSON.parse(lstore.get(_OUTBOX_KEY) || "[]"); }
   catch { return []; }
 }
 function _saveOutbox() {
-  try { localStorage.setItem(_OUTBOX_KEY, JSON.stringify(_outbox)); } catch {}
+  try { lstore.set(_OUTBOX_KEY, JSON.stringify(_outbox)); } catch {}
 }
 const _outbox = _loadOutbox();
 function sendOpReliable(obj) {
@@ -1983,7 +2075,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("focus", scheduleReadReceipt);
 
 function signOut() {
-  localStorage.removeItem("localchat-username");
+  lstore.remove("username");
   // Close socket cleanly so we don't auto-reconnect.
   if (S.ws) {
     try { S.ws.onclose = null; S.ws.close(); } catch {}
