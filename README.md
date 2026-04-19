@@ -86,10 +86,25 @@ The admin API is **localhost-only by default** and gated by a per-install token.
 
 ## Where your data lives
 
-Everything sits in `%APPDATA%\LocalChat\` on Windows (or `$XDG_DATA_HOME/LocalChat`
-on Linux/macOS). Want a clean slate? Stop the app, delete the folder, restart.
+On first launch LocalChat opens a tiny browser page asking where to keep its
+data. Pick any folder you like (the default is `C:\LocalChat` on Windows). The
+chosen path is remembered in **`%APPDATA%\LocalChat\config.json`** (or
+`~/.config/localchat/config.json` on Linux/macOS), so the exe can be moved,
+replaced, or upgraded without losing your data — and without asking again.
 
-Override the location with `LOCALCHAT_HOME=D:\path\to\folder`.
+Inside the chosen folder you'll find:
+
+- `localchat.db` — single SQLite file holding users, channels, messages,
+  reactions, read receipts, bans, and the per-database `server_id`.
+- `uploads/` — raw uploaded blobs (atomic writes, sha-prefixed names).
+- `tls/` — self-signed certificate + key (or your Let's Encrypt cert).
+- `logs/localchat.log` — rolling app log.
+- `config.json` — server settings, banlist, admin token.
+
+Want a clean slate? Stop the app, delete the data folder (and the AppData
+config if you want to be re-prompted), restart.
+
+Override the data folder for a single launch with `LOCALCHAT_HOME=D:\path\to\folder`.
 
 ## Building from source
 

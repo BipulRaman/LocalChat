@@ -49,15 +49,15 @@
 │ │  │  DashMap<UserId, UserInfo>           (known users)       │  │ │
 │ │  │  DashMap<usernameLower, UserId>      (identity map)      │  │ │
 │ │  │  DashMap<UserId, u32>                (socket refcount)   │  │ │
+│ │  │  DashMap<token, UserId>              (WS session tokens) │  │ │
 │ │  │  ChannelRegistry (DashMap + per-channel broadcast bus)   │  │ │
-│ │  │  HistoryStore   (append-only JSONL per channel)          │  │ │
-│ │  │  ReactionLog    (append-only JSONL global)               │  │ │
-│ │  │  JsonSnapshot   (atomic users.json + channels.json)      │  │ │
+│ │  │  Db             (single SQLite file, async via sqlx)     │  │ │
 │ │  │  Metrics        (atomic counters)                        │  │ │
 │ │  └──────────────────────────────────────────────────────────┘  │ │
 │ │                                                                │ │
-│ │  Disk: %APPDATA%\LocalChat\ ─ config + users + channels +      │ │
-│ │                                history + reactions + uploads   │ │
+│ │  Disk: <user-chosen folder> ─ localchat.db (SQLite) +          │ │
+│ │        config.json + tls/ + uploads/ + logs/                   │ │
+│ │  Pointer: %APPDATA%\LocalChat\config.json → { "data_dir": … }  │ │
 │ └────────────────────────────────────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -72,16 +72,16 @@ admin API, file uploads, and TLS termination.
 | File | Responsibility |
 |---|---|
 | `main.rs` | Tokio runtime; bootstraps `AppState`; spawns the axum server task; runs the tray event loop on the main thread (Windows requires it). |
-| `state.rs` | `AppState` — the single `Arc`-wrapped struct passed everywhere. Bootstrap loads config + persisted snapshots, hydrates channels, replays reactions, warms history. |
+| `state.rs` | `AppState` — the single `Arc`-wrapped struct passed everywhere. Bootstrap resolves the data folder (env / AppData config / browser picker), opens SQLite, hydrates users + channels + reactions from the DB, and warms in-RAM history rings. |
 | `config.rs` | `Config` — JSON-on-disk settings (port, admin token, max upload, history cap, banlist, autostart, allow-LAN-admin). Atomic save via tmp+rename. |
 | `user.rs` | `UserInfo`, `UserId` (u32). Includes pubkey, avatar, color, joined_at. |
 | `message.rs` | `WireMsg` — the one envelope used for everything (text, file, system, reactions, presence, typing, calls). `MsgKind`, `FileInfo`, `replyTo`. |
 | `channel.rs` | `Channel`, `ChannelRegistry`. Per-channel `tokio::broadcast::Sender`. Lobby + groups + DMs. DM ids are FNV-1a 64 of sorted lowercased usernames. |
-| `ws.rs` | The WebSocket handler. Owns per-socket subscription tasks, decodes ops, fans messages out via per-channel broadcast buses, persists to history. |
-| `http.rs` | axum routes: static assets (rust-embed), `/api/info`, file upload/download streaming, the WS upgrade. TLS via `rustls`. |
+| `ws.rs` | The WebSocket handler. Owns per-socket subscription tasks, decodes ops, fans messages out via per-channel broadcast buses, persists messages to SQLite, and mints session tokens used by HTTP endpoints. |
+| `http.rs` | axum routes: static assets (rust-embed), `/api/info` (returns `server_id`), file upload/download streaming (atomic temp+rename, `Authorization: Bearer <session-token>` from WS join), the WS upgrade. TLS via `rustls`. |
 | `admin.rs` | `/api/admin/*` — token-gated. Live metrics, ban/kick, broadcast, channel/file delete, settings GET/PATCH. |
 | `metrics.rs` | Atomic counters (messages, bytes uploaded, current connections, peak). |
-| `persist.rs` | `HistoryStore` (per-channel JSONL append + tail), `ReactionLog` (global JSONL), `JsonSnapshot` (atomic JSON write via tmp+rename). |
+| `db.rs` | `Db` — single SQLite file via `sqlx`. Schema migrations, all CRUD for users/channels/messages/reactions/read-receipts/bans/attachments. Owns the per-DB `server_id` UUID. |
 | `net.rs` | Port picker (tries `5000, 5050, 5555, 8080, …` then OS-assigned), LAN IP enumerator, console banner. |
 | `tray.rs` | `tray-icon` + `muda` integration; menu items: Open chat, Open admin, Quit. |
 | `applog.rs` | Tiny in-process log buffer + file writer (`logs/localchat.log`). |
@@ -265,69 +265,96 @@ event type on the bus.
 
 ## 8. Persistence model
 
-Everything lives under `%APPDATA%\LocalChat\` (overridable via
-`LOCALCHAT_HOME`):
+### 8.1 Where the data lives
+
+LocalChat keeps a **two-file pointer model**:
+
+1. **`%APPDATA%\LocalChat\config.json`** (Windows) /
+   `~/.config/localchat/config.json` (Unix) — a tiny per-user pointer file
+   holding only `{ "data_dir": "<absolute path>" }`. Survives moving,
+   replacing, or upgrading the exe; not tied to the binary's location.
+2. **The chosen data folder** — everything else lives here.
+
+`resolve_app_root()` order:
+
+1. `LOCALCHAT_HOME` env var (override for installers / tests / portable mode).
+2. `data_dir` from the AppData config above.
+3. No config yet → first-run **browser picker**: bind an ephemeral localhost
+   port, open the OS default browser, serve a one-input form, persist the
+   chosen path back to AppData. Headless / no-browser fallback uses the
+   default folder.
+
+Default folder: `C:\LocalChat` on Windows (deliberately outside Defender's
+"Controlled Folder Access" zones) and `~/LocalChat` on Unix.
+
+### 8.2 Layout inside the data folder
 
 ```
-LocalChat/
-├─ config.json          # settings, banlist, admin token
-├─ users.json           # { next_id, users: [UserInfo] }   (atomic snapshot)
-├─ channels.json        # [ChannelMeta]                    (atomic snapshot)
-├─ reactions.jsonl      # append-only per-event log
-├─ uploads/             # raw uploaded blobs (sha-prefixed names)
-└─ history/
-   ├─ pub-general.jsonl
-   ├─ grp-<id>.jsonl
-   └─ dm-<16hex>.jsonl  # ciphertext (e2e:v1:…) for DMs
+<data_dir>/
+├─ localchat.db         # single SQLite file (sqlx + tokio)
+├─ config.json          # server settings, banlist, admin token
+├─ tls/
+│  ├─ cert.pem
+│  └─ key.pem
+├─ uploads/             # raw blobs, atomic temp+rename
+└─ logs/
+   └─ localchat.log
 ```
 
-### `JsonSnapshot` (atomic JSON files)
+### 8.3 SQLite schema
 
-```rust
-pub async fn save<T: Serialize>(&self, value: &T) {
-    let _g = self.write_lock.lock().await;        // serialize writers
-    let tmp = self.path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?).await?;
-    fs::rename(&tmp, &self.path).await?;          // atomic on Windows + POSIX
-}
+A single `localchat.db` (WAL-mode SQLite, accessed asynchronously through
+`sqlx`) holds everything that used to be split across JSON snapshots and
+JSONL logs:
+
+| Table | Purpose |
+|---|---|
+| `meta` | One-row k/v: `server_id` (per-DB UUID), schema version. |
+| `users` | `id`, `username`, `display_name`, `created_at`, `last_seen`. |
+| `channels` | `id`, `kind` (lobby/public/private/dm), `name`, `created_at`. |
+| `channel_members` | `(channel_id, user_id)` membership for groups + DMs. |
+| `messages` | `id`, `channel_id`, `user_id`, `body` (plaintext or `e2e:v1:…` ciphertext for DMs), `kind`, `replied_to`, timestamps. |
+| `attachments` | Per-message file metadata (sha, mime, size, original name). |
+| `reactions` | `(channel_id, message_id, user_id, emoji)` toggles. |
+| `read_receipts` | `(channel_id, user_id, last_msg_id)`. |
+| `bans` | Banned usernames + IPs. |
+
+Atomic durability comes from SQLite's WAL + checkpoint discipline; no manual
+`.tmp`+`rename` needed. DMs are stored as `e2e:v1:…` ciphertext exactly as
+the browser sends them — the server never holds the key.
+
+### 8.4 `server_id` — per-database identity
+
+When the DB is first created, a UUIDv4 is written to `meta.server_id` and
+never changes. It is exposed via `/api/info` and used by the browser to
+**namespace `localStorage` per-database**, so a user who connects to two
+LocalChat servers (or whose admin runs a factory reset and gets a fresh DB)
+sees clean per-server settings instead of stale state from a different
+deployment.
+
+### 8.5 WS session tokens
+
+The WS `join` handshake mints a short opaque session token mapped to the
+caller's `UserId` in `AppState.sessions`. Plain HTTP endpoints (uploads in
+particular) require this token in an `Authorization: Bearer …` header so
+they can identify the user without a separate cookie/auth layer. Tokens
+live exactly as long as the WS connection that created them.
+
+### 8.6 Bootstrap order
+
 ```
-
-No partial files even if the host loses power mid-write.
-
-### `HistoryStore` (per-channel JSONL)
-
-- One line = one `WireMsg` JSON. No framing, no headers.
-- Append-only. `tail(channel, limit)` reads the last N lines for warming.
-- Rotation: when a file exceeds `rotate_mb` MB, it's renamed to `*.1.jsonl`
-  and a fresh file starts.
-
-### `ReactionLog`
-
-Reactions are stored as **events**, not state, because a reaction is
-toggle-on / toggle-off. Each line:
-
-```json
-{"c":"grp:abcd","m":42,"e":"🎉","u":7,"on":true,"ts":1700000000}
-```
-
-On boot, the entire log is replayed into `state.reactions` (a nested DashMap
-of `(channel, msgId) → emoji → Vec<UserId>`). Late writes are fine — the
-in-RAM map is the source of truth at runtime.
-
-### Bootstrap order
-
-```
-1. mkdir app_root + subdirs
-2. migrate_legacy_layout    (move pre-v2 files next to exe → app_root)
-3. Config::load_or_init     (creates config.json on first run)
-4. applog::init             (start logging to logs/localchat.log)
-5. ReactionLog::load_all    (parse reactions.jsonl)
-6. JsonSnapshot::load users + channels
-7. Build AppState           (DashMaps populated from snapshots)
-8. ChannelRegistry::hydrate (recreate Channel + members + broadcast bus)
-9. Replay reactions into state.reactions
-10. Warm history for every channel (read tail(N) into Channel.history)
-11. Compute next_msg_id from max id seen + 1
+1. resolve_app_root           (env → AppData config → browser picker)
+2. verify_writable            (probe write; fail fast on Defender / ACLs)
+3. mkdir uploads/, logs/
+4. Config::load_or_init       (creates config.json on first run)
+5. applog::init               (start logging to logs/localchat.log)
+6. Db::open                   (open SQLite, run migrations, mint server_id
+                               on first creation)
+7. Hydrate AppState           (users, channels, members, reactions,
+                               next_user_id, next_msg_id from DB)
+8. ChannelRegistry::hydrate   (recreate Channel + members + broadcast bus)
+9. Warm history               (tail(N) per channel from messages table)
+10. Apply bans into config
 ```
 
 After that, the server is ready to bind.
@@ -576,11 +603,11 @@ participants. If you don't trust the host, don't connect.
 | Understand the bootstrap sequence | `state.rs::AppState::bootstrap` |
 | Add a new client→server op | `ws.rs` — match arm in the recv loop |
 | Add a new client-side event | `app.js::handleEvent` |
-| Change persistence format | `persist.rs` |
+| Change persistence format | `db.rs` (SQLite schema + queries) |
 | Change DM id derivation | `channel.rs::dm_id_for_names` |
 | Touch the admin UI | `web/admin.html` + `web/admin.js` + `admin.rs` |
 | Tune fan-out buffer | `channel.rs::Channel::new` (`broadcast::channel(256)`) |
-| Tune history rotation | `config.json` → `rotate_mb`, `history_ram` |
+| Tune history cap | `config.json` → `history_ram` |
 
 ---
 
