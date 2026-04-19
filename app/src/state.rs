@@ -20,7 +20,6 @@ pub struct AppState {
     pub app_root: PathBuf,   // OS app-data dir (e.g. %APPDATA%\LocalChat)
     pub uploads_dir: PathBuf,
     pub config_path: PathBuf,
-    pub history_dir: PathBuf,
     pub logs_dir: PathBuf,
 
     pub config: RwLock<Config>,
@@ -79,7 +78,6 @@ impl AppState {
             app_root,
             uploads_dir,
             config_path,
-            history_dir: history_dir.clone(),
             logs_dir,
             config: RwLock::new(config),
             channels: ChannelRegistry::new(history_cap),

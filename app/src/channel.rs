@@ -64,7 +64,9 @@ impl Channel {
         created_by: UserId,
         history_cap: usize,
     ) -> Self {
-        let (tx, _) = broadcast::channel(64);
+        // Buffer sized to absorb short subscriber lag without dropping.
+        // Each slot is an Arc<WireMsg> (8 bytes), so 256 is cheap.
+        let (tx, _) = broadcast::channel(256);
         Self {
             id,
             kind,
@@ -257,6 +259,20 @@ impl ChannelRegistry {
         }
         self.map.remove(id);
         members
+    }
+
+    /// Permanently delete any channel except the lobby. Returns the list of
+    /// UserIds that had it attached so callers can notify them. Returns
+    /// `None` if the channel doesn't exist or is the lobby.
+    pub fn delete_any(&self, id: &str) -> Option<Vec<UserId>> {
+        let ch = self.get(id)?;
+        if matches!(ch.kind, ChannelKind::Lobby) { return None; }
+        let members: Vec<UserId> = ch.members.iter().map(|e| *e).collect();
+        for uid in &members {
+            self.remove_user_channel(*uid, id);
+        }
+        self.map.remove(id);
+        Some(members)
     }
 
     /// Return channels visible to `user`: public groups + their own.

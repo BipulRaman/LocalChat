@@ -50,9 +50,23 @@ async fn authorize(
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-token").and_then(|v| v.to_str().ok()));
     match tok {
-        Some(t) if t == cfg.admin_token => Ok(()),
+        Some(t) if constant_time_eq(t.as_bytes(), cfg.admin_token.as_bytes()) => Ok(()),
         _ => Err((StatusCode::UNAUTHORIZED, "bad token".into())),
     }
+}
+
+/// Constant-time byte-slice comparison. Avoids leaking the admin token
+/// length / contents through response-time side channels when
+/// `allow_lan_admin` is enabled.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 macro_rules! auth {
@@ -291,8 +305,35 @@ async fn delete_channel(
     if id == LOBBY_ID {
         return Err((StatusCode::BAD_REQUEST, "cannot delete lobby".into()));
     }
-    state.channels.map.remove(&compact_str::CompactString::from(id.clone()));
+    let cid = compact_str::CompactString::from(id.clone());
+    // Notify subscribers before tearing down so live clients drop the channel.
+    if let Some(ch) = state.channels.get(&id) {
+        use crate::message::{now_secs, MsgKind, WireMsg};
+        use compact_str::CompactString;
+        let marker = if matches!(ch.kind, crate::channel::ChannelKind::Dm) {
+            "__dm_deleted"
+        } else {
+            "__ch_deleted"
+        };
+        let _ = ch.tx.send(Arc::new(WireMsg {
+            id: 0,
+            channel: cid.clone(),
+            kind: MsgKind::System,
+            user_id: 0,
+            username: CompactString::from(marker),
+            avatar: CompactString::const_new(""),
+            color: CompactString::const_new(""),
+            ts: now_secs(),
+            text: json!({"channel": cid}).to_string(),
+            file: None,
+            reply_to: None,
+            edited_at: None,
+            deleted: true,
+        }));
+    }
+    state.channels.delete_any(&id);
     state.history.delete_channel(&id).await;
+    state.reactions.retain(|(c, _), _| c != &cid);
     Ok(Json(json!({"ok": true})))
 }
 
@@ -377,7 +418,7 @@ async fn share(
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut push = |label: &str, url: String, entries: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<String>| {
+    let push = |label: &str, url: String, entries: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<String>| {
         if !seen.insert(url.clone()) { return; }
         let qr = render_qr_svg(&url);
         entries.push(json!({ "label": label, "url": url, "qr": qr }));

@@ -97,10 +97,6 @@ impl HistoryStore {
         let path = self.path_for(channel);
         let _ = tokio::fs::remove_file(path).await;
     }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

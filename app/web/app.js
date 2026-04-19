@@ -408,6 +408,13 @@ async function onWireMsg(m) {
     } catch {}
     return;
   }
+  if (m.username === "__ch_deleted") {
+    try {
+      const id = JSON.parse(m.text).channel || m.channel;
+      onChannelDeleted(id);
+    } catch {}
+    return;
+  }
   // Suppress noisy join/leave system messages.
   if (m.kind === "system" && /\b(joined|left) the chat\b/.test(m.text || "")) {
     return;
@@ -569,9 +576,20 @@ function _sbGroup(key, title, count, items) {
 function _channelItem(c) {
   const active = c.id === S.active ? "active" : "";
   const unread = S.unread.get(c.id) || 0;
+  const canDelete = c.kind === "group" && S.me && c.createdBy === S.me.id;
+  const askDelete = canDelete ? (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    confirmDialog({
+      title: "Delete channel",
+      body: `Delete channel #${c.name || c.id}?\n\nThis removes the channel and its history for everyone. This cannot be undone.`,
+      okText: "Delete",
+    }).then((ok) => { if (ok) deleteChannel(c.id); });
+  } : null;
   return el("li", {
     class: "chat-item " + active,
     onclick: () => switchChannel(c.id),
+    oncontextmenu: askDelete || undefined,
   }, [
     el("div", { class: "avatar", style: `background:var(--brand)` }, "#"),
     el("div", { class: "chat-meta" }, [
@@ -580,7 +598,18 @@ function _channelItem(c) {
         c.kind === "lobby" ? "lobby \u00b7 everyone" : (c.isPrivate ? "private channel" : "channel")),
     ]),
     unread ? el("span", { class: "badge badge-unread" }, String(unread)) : null,
+    canDelete ? el("button", {
+      class: "chat-del",
+      title: `Delete #${c.name || c.id}`,
+      "aria-label": "Delete channel",
+      onclick: askDelete,
+      html: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>`,
+    }) : null,
   ]);
+}
+
+function deleteChannel(channelId) {
+  sendOp({ op: "ch_delete", channel: channelId });
 }
 
 function _dmItem(c) {

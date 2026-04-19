@@ -282,6 +282,9 @@ fn pick_color_for(username: &str) -> &'static str {
 }
 
 /// Merge-style receive: await on whichever channel fires first.
+/// Uses a SmallVec to keep the per-message future array on the stack for
+/// the common case (≤ 8 channels per user) — no heap allocation in the
+/// hot WS loop.
 async fn recv_any(
     rxs: &mut smallvec::SmallVec<[broadcast::Receiver<Arc<WireMsg>>; 8]>,
 ) -> Option<Arc<WireMsg>> {
@@ -289,7 +292,7 @@ async fn recv_any(
     if rxs.is_empty() {
         return futures_util::future::pending().await;
     }
-    let futs: Vec<_> = rxs
+    let futs: smallvec::SmallVec<[_; 8]> = rxs
         .iter_mut()
         .map(|rx| Box::pin(rx.recv().map(|r| r.ok())))
         .collect();
@@ -687,6 +690,42 @@ async fn handle_op(
             // Wipe persisted history.
             state.history.delete_channel(&id_str).await;
             // Drop our own subscription so the local rxs loop stops polling it.
+            own_channels.retain(|c| c != &id_str);
+            let _ = sink
+                .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))
+                .await;
+        }
+
+        "ch_delete" => {
+            let id = v.get("channel").and_then(Value::as_str).ok_or("missing channel")?;
+            let ch = state.channels.get(id).ok_or("no such channel")?;
+            if !matches!(ch.kind, ChannelKind::Group) {
+                return Err("only group channels can be deleted".into());
+            }
+            if ch.created_by != user_id {
+                return Err("only the creator can delete this channel".into());
+            }
+            let id_str: CompactString = ch.id.clone();
+            // Notify all subscribers BEFORE we drop the broadcaster.
+            let _ = ch.tx.send(Arc::new(WireMsg {
+                id: 0,
+                channel: id_str.clone(),
+                kind: MsgKind::System,
+                user_id,
+                username: CompactString::const_new("__ch_deleted"),
+                avatar: CompactString::const_new(""),
+                color: CompactString::const_new(""),
+                ts: now_secs(),
+                text: json!({"channel": id_str}).to_string(),
+                file: None,
+                reply_to: None,
+                edited_at: None,
+                deleted: true,
+            }));
+            state.channels.delete_any(&id_str);
+            state.history.delete_channel(&id_str).await;
+            // Drop reactions for this channel.
+            state.reactions.retain(|(c, _), _| c != &id_str);
             own_channels.retain(|c| c != &id_str);
             let _ = sink
                 .send(Message::Text(json!({"ev":"ch_deleted","channel":id_str}).to_string()))

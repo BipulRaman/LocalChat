@@ -1,6 +1,5 @@
 //! Wire message envelope. One schema for lobby, groups, and DMs.
 
-use bytes::Bytes;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
@@ -59,18 +58,6 @@ pub struct WireMsg {
 
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
-}
-
-impl WireMsg {
-    /// Pre-serialize to bytes once; shared by all subscribers (zero-copy fan-out).
-    pub fn to_bytes(&self) -> Bytes {
-        let mut v = Vec::with_capacity(256);
-        // Wrap as {"ev":"msg", ...}
-        v.extend_from_slice(br#"{"ev":"msg","m":"#);
-        serde_json::to_writer(&mut v, self).ok();
-        v.push(b'}');
-        Bytes::from(v)
-    }
 }
 
 pub fn now_secs() -> u64 {

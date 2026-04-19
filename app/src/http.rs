@@ -14,9 +14,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use compact_str::{CompactString, ToCompactString};
+use compact_str::ToCompactString;
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -197,12 +197,26 @@ fn hostname() -> String {
 
 async fn upload(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<FileInfo>, (StatusCode, String)> {
     let max_bytes = {
         let cfg = state.config.read().unwrap();
         cfg.max_upload_mb.saturating_mul(1024 * 1024)
     };
+
+    // Fail fast on obviously oversized requests — 1 MiB slack for
+    // multipart framing overhead. Streaming check below is still the
+    // authoritative limit.
+    if let Some(len) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if len > max_bytes.saturating_add(1024 * 1024) {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "file too big".into()));
+        }
+    }
 
     while let Some(mut field) = multipart
         .next_field()
@@ -368,11 +382,4 @@ async fn serve_asset(uri: Uri) -> impl IntoResponse {
             }
         }
     }
-}
-
-// Re-export for admin module.
-#[derive(Serialize)]
-pub struct AssetMeta {
-    pub name: CompactString,
-    pub bytes: u64,
 }
