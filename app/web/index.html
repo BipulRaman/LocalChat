@@ -215,6 +215,18 @@
       <div id="typing" class="typing-row"></div>
 
       <form id="sendForm" class="composer" autocomplete="off">
+        <div id="replyPreview" class="reply-preview hidden" aria-live="polite">
+          <div class="reply-preview-bar"></div>
+          <div class="reply-preview-body">
+            <div class="reply-preview-head">
+              <span>Replying to <strong id="replyPreviewName"></strong></span>
+            </div>
+            <div id="replyPreviewText" class="reply-preview-text"></div>
+          </div>
+          <button type="button" class="icon-btn reply-preview-close" id="replyPreviewClose" title="Cancel reply (Esc)" aria-label="Cancel reply">
+            <svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
         <textarea id="msgInput" rows="1" placeholder="Type a message" maxlength="4000"></textarea>
         <button type="button" class="emoji-btn" id="emojiBtn" title="Emoji" aria-label="Emoji">
           <span aria-hidden="true">😊</span>

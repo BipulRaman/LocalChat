@@ -215,6 +215,7 @@ const S = {
   hostname: "",
   sidebarTab: "mine",
   sidebarFilter: "",
+  replyTo: null,           // { channelId, msgId, username, preview }
 };
 
 // ── Boot ─────────────────────────────────────────────────────────────
@@ -1001,6 +1002,38 @@ async function renderMessage(m, { follow, peer, ch }) {
 
   const bubble = el("div", { class: "bubble" });
 
+  // Replied-to quote: render at top of the bubble. Click jumps to original.
+  if (m.replyTo) {
+    const orig = (S.msgs.get(m.channel) || []).find((x) => x.id === m.replyTo);
+    let quoteText = "(original message unavailable)";
+    let quoteName = "message";
+    let quoteColor = "var(--brand)";
+    if (orig) {
+      quoteName = orig.username || quoteName;
+      quoteColor = orig.color || quoteColor;
+      let t = orig.text || "";
+      if (peer && t.startsWith("e2e:v1:")) {
+        const pt = await E2EE.tryDecrypt(peer.id, peer.pubkey, t);
+        t = pt != null ? pt : "🔒 (encrypted)";
+      }
+      if (orig.kind === "file") {
+        t = orig.file?.originalName ? `📎 ${orig.file.originalName}` : "📎 attachment";
+      }
+      quoteText = t.length > 160 ? t.slice(0, 160) + "…" : (t || "(empty)");
+    }
+    const quote = el("button", {
+      type: "button",
+      class: "reply-quote",
+      style: `border-left-color:${quoteColor}`,
+      title: `Jump to ${quoteName}'s message`,
+      onclick: (ev) => { ev.stopPropagation(); jumpToMessage(m.channel, m.replyTo); },
+    }, [
+      el("div", { class: "reply-quote-name", style: `color:${quoteColor}` }, quoteName),
+      el("div", { class: "reply-quote-text" }, quoteText),
+    ]);
+    bubble.append(quote);
+  }
+
   // Header row above the bubble (Teams-style):
   //  - incoming first-of-group: "Author • Time"
   //  - own first-of-group: "Time" right-aligned
@@ -1110,7 +1143,7 @@ async function renderMessage(m, { follow, peer, ch }) {
     el("button", {
       class: "ma-btn",
       title: "Reply",
-      onclick: (ev) => { ev.stopPropagation(); /* TODO: reply-to */ },
+      onclick: (ev) => { ev.stopPropagation(); startReplyTo(m, displayText); },
       html: `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M10 9V5l-7 7 7 7v-4c5 0 8 1.5 10 5-1-7-5-11-10-11z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>`,
     }),
   ]);
@@ -1127,7 +1160,7 @@ async function renderMessage(m, { follow, peer, ch }) {
   if (header) stack.append(header);
   stack.append(bubble);
 
-  return el("div", { class: classes.join(" ") }, [avatar, stack]);
+  return el("div", { class: classes.join(" "), id: `m-${m.channel}-${m.id}` }, [avatar, stack]);
 }
 
 // Compute tick state for an own message:
@@ -1278,6 +1311,8 @@ function isAtBottom(box) {
 function switchChannel(id) {
   S.active = id;
   S.unread.set(id, 0);
+  if (S.replyTo && S.replyTo.channelId !== id) clearReplyTo();
+  else renderReplyPreview();
   renderChannels();
   renderMembers();
   renderTyping();
@@ -1355,13 +1390,67 @@ async function sendMessage(rawText) {
     }
   }
 
-  sendOp({ op: "send", channel: S.active, text: payload });
+  const op = { op: "send", channel: S.active, text: payload };
+  if (S.replyTo && S.replyTo.channelId === S.active) op.replyTo = S.replyTo.msgId;
+  sendOp(op);
   sendOp({ op: "typing", channel: S.active, typing: false });
+  clearReplyTo();
 }
+
+// ── Reply-to ──────────────────────────────────────────────────────────
+function startReplyTo(m, plainText) {
+  if (!m || m.kind === "system") return;
+  const txt = (plainText != null ? plainText : (m.text || "")).toString();
+  const preview = m.kind === "file"
+    ? (m.file?.originalName ? `📎 ${m.file.originalName}` : "📎 attachment")
+    : (txt.length > 140 ? txt.slice(0, 140) + "…" : txt);
+  S.replyTo = {
+    channelId: m.channel,
+    msgId: m.id,
+    username: m.username || "",
+    preview,
+  };
+  renderReplyPreview();
+  $("msgInput").focus();
+}
+function clearReplyTo() {
+  if (!S.replyTo) return;
+  S.replyTo = null;
+  renderReplyPreview();
+}
+function renderReplyPreview() {
+  const box = $("replyPreview");
+  if (!box) return;
+  if (!S.replyTo || S.replyTo.channelId !== S.active) {
+    box.classList.add("hidden");
+    return;
+  }
+  $("replyPreviewName").textContent = S.replyTo.username || "message";
+  $("replyPreviewText").textContent = S.replyTo.preview || "";
+  box.classList.remove("hidden");
+}
+Object.assign(window, { startReplyTo, clearReplyTo });
+
+function jumpToMessage(channelId, msgId) {
+  if (channelId !== S.active) switchChannel(channelId);
+  const tryScroll = (tries) => {
+    const node = document.getElementById(`m-${channelId}-${msgId}`);
+    if (node) {
+      node.scrollIntoView({ behavior: "smooth", block: "center" });
+      node.classList.add("msg-flash");
+      setTimeout(() => node.classList.remove("msg-flash"), 1600);
+    } else if (tries > 0) {
+      setTimeout(() => tryScroll(tries - 1), 80);
+    }
+  };
+  tryScroll(8);
+}
+Object.assign(window, { jumpToMessage });
 const _warnedNoKey = new Set();
 
 // Composer
 const msgInput = $("msgInput");
+$("replyPreviewClose")?.addEventListener("click", () => clearReplyTo());
 msgInput.addEventListener("input", () => {
   autoGrow(msgInput);
   if (S.typingTimer) clearTimeout(S.typingTimer);
@@ -1369,6 +1458,11 @@ msgInput.addEventListener("input", () => {
   S.typingTimer = setTimeout(() => sendOp({ op: "typing", channel: S.active, typing: false }), 2500);
 });
 msgInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && S.replyTo) {
+    e.preventDefault();
+    clearReplyTo();
+    return;
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     const v = msgInput.value;
