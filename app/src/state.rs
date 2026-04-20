@@ -1,7 +1,7 @@
 //! Central shared state. Wrapped in `Arc<AppState>` and handed everywhere.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use compact_str::ToCompactString;
@@ -68,7 +68,6 @@ pub struct AppState {
     /// WS connection that created them.
     pub sessions: DashMap<compact_str::CompactString, UserId>,
 
-    pub next_user_id: AtomicU32,
     pub next_msg_id: AtomicU64,
 
     pub bound_port: AtomicU16,
@@ -82,7 +81,7 @@ pub struct AppState {
     pub resetting: AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum KickSignal {
     All,
     User(UserId),
@@ -140,10 +139,9 @@ impl AppState {
         let username_to_id: DashMap<compact_str::CompactString, UserId> = DashMap::new();
         let known_users: DashMap<UserId, UserInfo> = DashMap::new();
         for u in &known {
-            username_to_id.insert(u.username.to_lowercase().to_compact_string(), u.id);
-            known_users.insert(u.id, u.clone());
+            username_to_id.insert(u.username.to_lowercase().to_compact_string(), u.id.clone());
+            known_users.insert(u.id.clone(), u.clone());
         }
-        let next_user_id = db.next_user_id().await.unwrap_or(1).max(1);
 
         let channels = ChannelRegistry::new(history_cap);
         let prior_channels = db.list_channels().await.unwrap_or_default();
@@ -154,7 +152,7 @@ impl AppState {
                 ChannelKind::Lobby,
                 compact_str::CompactString::const_new(LOBBY_NAME),
                 false,
-                0,
+                compact_str::CompactString::const_new(""),
                 channels.history_cap,
             );
             channels.map.insert(lobby.id.clone(), Arc::new(lobby));
@@ -206,7 +204,6 @@ impl AppState {
             db,
             server_id,
             sessions: DashMap::new(),
-            next_user_id: AtomicU32::new(next_user_id),
             next_msg_id: AtomicU64::new(next_msg),
             bound_port: AtomicU16::new(0),
             kick_tx: tokio::sync::broadcast::channel(16).0,
@@ -216,10 +213,6 @@ impl AppState {
 
     pub fn next_msg_id(&self) -> u64 {
         self.next_msg_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn next_user_id(&self) -> UserId {
-        self.next_user_id.fetch_add(1, Ordering::Relaxed)
     }
 
     #[allow(dead_code)] // helper used by future admin endpoints

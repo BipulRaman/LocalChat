@@ -36,12 +36,13 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    id              INTEGER PRIMARY KEY,
+    id              TEXT    PRIMARY KEY,
     username        TEXT    NOT NULL,
     username_lower  TEXT    NOT NULL UNIQUE,
     avatar          TEXT    NOT NULL DEFAULT '',
     color           TEXT    NOT NULL DEFAULT '',
     pubkey          TEXT    NOT NULL DEFAULT '',
+    password_hash   TEXT    NOT NULL DEFAULT '',
     joined_at       INTEGER NOT NULL,
     last_connect    INTEGER NOT NULL DEFAULT 0,
     last_seen       INTEGER NOT NULL DEFAULT 0,
@@ -57,7 +58,7 @@ CREATE TABLE IF NOT EXISTS channels (
     kind        TEXT    NOT NULL CHECK (kind IN ('lobby','group','dm')),
     name        TEXT    NOT NULL DEFAULT '',
     is_private  INTEGER NOT NULL DEFAULT 0,
-    created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_by  TEXT    REFERENCES users(id) ON DELETE SET NULL,
     created_at  INTEGER NOT NULL,
     dm_user_a   TEXT,
     dm_user_b   TEXT
@@ -66,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_channels_kind ON channels(kind);
 
 CREATE TABLE IF NOT EXISTS channel_members (
     channel_id  TEXT    NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    user_id     INTEGER NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+    user_id     TEXT    NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
     joined_at   INTEGER NOT NULL,
     PRIMARY KEY (channel_id, user_id)
 );
@@ -75,7 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_members_user ON channel_members(user_id);
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY,
     channel_id  TEXT    NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    user_id     TEXT    REFERENCES users(id) ON DELETE SET NULL,
     username    TEXT    NOT NULL DEFAULT '',
     avatar      TEXT    NOT NULL DEFAULT '',
     color       TEXT    NOT NULL DEFAULT '',
@@ -103,7 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_user       ON messages(user_id);
 
 CREATE TABLE IF NOT EXISTS reactions (
     message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    user_id     INTEGER NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+    user_id     TEXT    NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
     emoji       TEXT    NOT NULL,
     ts          INTEGER NOT NULL,
     PRIMARY KEY (message_id, user_id, emoji)
@@ -116,7 +117,7 @@ CREATE TABLE IF NOT EXISTS reaction_events (
     ts          INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
     channel_id  TEXT    NOT NULL,
-    user_id     INTEGER NOT NULL,
+    user_id     TEXT    NOT NULL,
     emoji       TEXT    NOT NULL,
     on_         INTEGER NOT NULL
 );
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          INTEGER NOT NULL,
     event       TEXT    NOT NULL CHECK (event IN ('connect','disconnect')),
-    user_id     INTEGER NOT NULL,
+    user_id     TEXT    NOT NULL,
     username    TEXT    NOT NULL,
     ip          TEXT    NOT NULL DEFAULT '',
     user_agent  TEXT    NOT NULL DEFAULT '',
@@ -151,7 +152,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_name TEXT    NOT NULL,
     mime          TEXT    NOT NULL DEFAULT '',
     size          INTEGER NOT NULL,
-    uploaded_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    uploaded_by   TEXT    REFERENCES users(id) ON DELETE SET NULL,
     uploaded_by_name TEXT NOT NULL DEFAULT '',
     uploaded_at   INTEGER NOT NULL,
     message_id    INTEGER REFERENCES messages(id) ON DELETE SET NULL
@@ -288,6 +289,7 @@ impl Db {
 
     #[allow(dead_code)] // public API surface, not currently called
     pub async fn user_by_id(&self, id: UserId) -> rusqlite::Result<Option<UserInfo>> {
+        let id = id.to_string();
         self.with(move |c| {
             c.query_row(
                 "SELECT id, username, avatar, color, pubkey, joined_at,
@@ -312,9 +314,17 @@ impl Db {
                     id, username, username_lower, avatar, color, pubkey,
                     joined_at, last_connect, last_seen, last_ip,
                     total_sessions, msg_count, bytes_uploaded
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(id) DO UPDATE SET
+                    username       = excluded.username,
+                    username_lower = excluded.username_lower,
+                    avatar         = excluded.avatar,
+                    color          = excluded.color,
+                    pubkey         = CASE WHEN excluded.pubkey <> '' THEN excluded.pubkey ELSE users.pubkey END,
+                    last_connect   = excluded.last_connect,
+                    last_ip        = excluded.last_ip",
                 params![
-                    i.id,
+                    i.id.as_str(),
                     i.username.as_str(),
                     i.username.to_lowercase().to_string(),
                     i.avatar.as_str(),
@@ -336,31 +346,41 @@ impl Db {
 
     /// Mark a user as currently connecting. Bumps total_sessions, sets
     /// last_connect/last_ip, optionally updates avatar/color/pubkey if
-    /// the client supplied them.
+    /// the client supplied them. UPSERT — if the row was wiped out from
+    /// under us (admin reset, manual db edit) we re-create it instead
+    /// of silently failing every later FK insert.
     pub async fn touch_user_on_connect(
         &self,
         id: UserId,
+        username: &str,
         avatar: &str,
         color: &str,
         pubkey: &str,
         ip: &str,
         ts: u64,
     ) -> rusqlite::Result<()> {
+        let id = id.to_string();
+        let username = username.to_string();
+        let lname = username.to_lowercase();
         let avatar = avatar.to_string();
         let color = color.to_string();
         let pubkey = pubkey.to_string();
         let ip = ip.to_string();
         self.with(move |c| {
             c.execute(
-                "UPDATE users
-                    SET avatar       = CASE WHEN ?2 <> '' THEN ?2 ELSE avatar END,
-                        color        = CASE WHEN ?3 <> '' THEN ?3 ELSE color END,
-                        pubkey       = CASE WHEN ?4 <> '' THEN ?4 ELSE pubkey END,
-                        last_connect = ?5,
-                        last_ip      = ?6,
-                        total_sessions = total_sessions + 1
-                  WHERE id = ?1",
-                params![id, avatar, color, pubkey, ts as i64, ip],
+                "INSERT INTO users(
+                    id, username, username_lower, avatar, color, pubkey,
+                    joined_at, last_connect, last_seen, last_ip,
+                    total_sessions, msg_count, bytes_uploaded
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0, ?8, 1, 0, 0)
+                 ON CONFLICT(id) DO UPDATE SET
+                    avatar       = CASE WHEN ?4 <> '' THEN ?4 ELSE users.avatar END,
+                    color        = CASE WHEN ?5 <> '' THEN ?5 ELSE users.color END,
+                    pubkey       = CASE WHEN ?6 <> '' THEN ?6 ELSE users.pubkey END,
+                    last_connect = ?7,
+                    last_ip      = ?8,
+                    total_sessions = total_sessions + 1",
+                params![id, username, lname, avatar, color, pubkey, ts as i64, ip],
             )?;
             Ok(())
         })
@@ -373,6 +393,7 @@ impl Db {
         ip: &str,
         ts: u64,
     ) -> rusqlite::Result<()> {
+        let id = id.to_string();
         let ip = ip.to_string();
         self.with(move |c| {
             c.execute(
@@ -385,6 +406,7 @@ impl Db {
     }
 
     pub async fn bump_user_msg_count(&self, id: UserId) -> rusqlite::Result<()> {
+        let id = id.to_string();
         self.with(move |c| {
             c.execute("UPDATE users SET msg_count = msg_count + 1 WHERE id = ?1", params![id])?;
             Ok(())
@@ -393,6 +415,7 @@ impl Db {
     }
 
     pub async fn bump_user_uploaded(&self, id: UserId, bytes: u64) -> rusqlite::Result<()> {
+        let id = id.to_string();
         self.with(move |c| {
             c.execute(
                 "UPDATE users SET bytes_uploaded = bytes_uploaded + ?2 WHERE id = ?1",
@@ -411,7 +434,7 @@ impl Db {
                 "SELECT id, username, avatar, color, pubkey, joined_at,
                         last_connect, last_seen, last_ip,
                         total_sessions, msg_count, bytes_uploaded
-                   FROM users ORDER BY id",
+                   FROM users ORDER BY joined_at",
             )?;
             let rows = stmt.query_map([], row_to_user)?;
             let mut out = Vec::new();
@@ -421,22 +444,50 @@ impl Db {
         .await
     }
 
-    /// Return the next free user id. SQLite assigns it for us by using
-    /// `MAX(id)+1`; cheap because `id` is the primary key.
-    pub async fn next_user_id(&self) -> rusqlite::Result<UserId> {
-        self.with(|c| {
-            let id: Option<i64> = c
-                .query_row("SELECT COALESCE(MAX(id), 0) FROM users", [], |r| r.get(0))
-                .optional()?
-                .flatten();
-            Ok((id.unwrap_or(0) as u32) + 1)
+    pub async fn delete_user(&self, id: UserId) -> rusqlite::Result<()> {
+        let id = id.to_string();
+        self.with(move |c| {
+            c.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+            Ok(())
         })
         .await
     }
 
-    pub async fn delete_user(&self, id: UserId) -> rusqlite::Result<()> {
+    /// Look up `(id, password_hash)` for a username (case-insensitive).
+    /// Returns `None` when the username has never been registered.
+    /// `password_hash` is empty string for legacy rows that predate
+    /// the password feature.
+    pub async fn find_user_credentials(
+        &self,
+        username: &str,
+    ) -> rusqlite::Result<Option<(UserId, String)>> {
+        let key = username.to_lowercase();
         self.with(move |c| {
-            c.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+            let row = c
+                .query_row(
+                    "SELECT id, password_hash FROM users WHERE username_lower = ?1",
+                    params![key],
+                    |r| Ok((r.get::<_, String>(0)?.to_compact_string(), r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Persist a freshly computed password hash for `user_id`.
+    pub async fn set_password_hash(
+        &self,
+        user_id: UserId,
+        hash: &str,
+    ) -> rusqlite::Result<()> {
+        let id = user_id.to_string();
+        let hash = hash.to_string();
+        self.with(move |c| {
+            c.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+                params![hash, id],
+            )?;
             Ok(())
         })
         .await
@@ -445,7 +496,7 @@ impl Db {
 
 fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserInfo> {
     Ok(UserInfo {
-        id: r.get::<_, i64>(0)? as u32,
+        id: r.get::<_, String>(0)?.to_compact_string(),
         username: r.get::<_, String>(1)?.to_compact_string(),
         avatar: r.get::<_, String>(3)?.to_compact_string(),
         color: r.get::<_, String>(4)?.to_compact_string(),
@@ -492,9 +543,9 @@ impl Db {
                     m.name.as_str(),
                     m.is_private as i64,
                     // created_by is a FK to users(id); the lobby (and any
-                    // system-created channel) carries 0 here, so coerce
-                    // that to NULL to satisfy the foreign key.
-                    if m.created_by == 0 { None } else { Some(m.created_by) },
+                    // system-created channel) carries an empty string here,
+                    // so coerce that to NULL to satisfy the foreign key.
+                    if m.created_by.is_empty() { None } else { Some(m.created_by.as_str()) },
                     m.created_at as i64,
                     dm_a,
                     dm_b,
@@ -530,7 +581,7 @@ impl Db {
             let mut by_chan: std::collections::HashMap<String, Vec<UserId>> =
                 std::collections::HashMap::new();
             let mrows = mstmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?.to_compact_string()))
             })?;
             for row in mrows {
                 let (cid, uid) = row?;
@@ -548,11 +599,12 @@ impl Db {
 
     pub async fn add_member(&self, channel_id: &str, user_id: UserId, ts: u64) -> rusqlite::Result<()> {
         let cid = channel_id.to_string();
+        let uid = user_id.to_string();
         self.with(move |c| {
             c.execute(
                 "INSERT OR IGNORE INTO channel_members(channel_id, user_id, joined_at)
                  VALUES (?1, ?2, ?3)",
-                params![cid, user_id, ts as i64],
+                params![cid, uid, ts as i64],
             )?;
             Ok(())
         })
@@ -561,10 +613,11 @@ impl Db {
 
     pub async fn remove_member(&self, channel_id: &str, user_id: UserId) -> rusqlite::Result<()> {
         let cid = channel_id.to_string();
+        let uid = user_id.to_string();
         self.with(move |c| {
             c.execute(
                 "DELETE FROM channel_members WHERE channel_id = ?1 AND user_id = ?2",
-                params![cid, user_id],
+                params![cid, uid],
             )?;
             Ok(())
         })
@@ -590,7 +643,7 @@ fn row_to_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelMeta> {
         name: r.get::<_, String>(2)?.to_compact_string(),
         is_private: r.get::<_, i64>(3)? != 0,
         members: Vec::new(),
-        created_by: r.get::<_, i64>(4).unwrap_or(0) as u32,
+        created_by: r.get::<_, Option<String>>(4)?.unwrap_or_default().to_compact_string(),
         created_at: r.get::<_, i64>(5)? as u64,
         dm_users,
     })
@@ -674,7 +727,7 @@ impl Db {
                 params![
                     m.id as i64,
                     m.channel.as_str(),
-                    if m.user_id == 0 { None } else { Some(m.user_id) },
+                    if m.user_id.is_empty() { None } else { Some(m.user_id.as_str()) },
                     m.username.as_str(),
                     m.avatar.as_str(),
                     m.color.as_str(),
@@ -737,6 +790,46 @@ impl Db {
         })
         .await
     }
+
+    /// Hard-blank every chat message that referenced a now-deleted upload.
+    /// Returns the affected `(channel_id, message_id)` pairs so callers can
+    /// fan out a live "media deleted" broadcast to currently connected
+    /// clients. The message rows are kept (so reply chains and ordering
+    /// stay intact) but their kind flips to `system`, the text becomes a
+    /// human-readable marker, and every file_* column is nulled out — so a
+    /// later history fetch reflects the deletion exactly the same way.
+    pub async fn purge_upload_refs(
+        &self,
+        storage_name: &str,
+    ) -> rusqlite::Result<Vec<(String, u64)>> {
+        let needle = format!("%/uploads/{}", storage_name);
+        self.with(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT channel_id, id FROM messages WHERE file_url LIKE ?1",
+            )?;
+            let pairs: Vec<(String, u64)> = stmt
+                .query_map(params![needle], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            c.execute(
+                "UPDATE messages
+                    SET kind      = 'system',
+                        text      = '🗑️ Media deleted by admin',
+                        file_id   = NULL,
+                        file_name = NULL,
+                        file_size = NULL,
+                        file_mime = NULL,
+                        file_url  = NULL,
+                        deleted   = 1
+                  WHERE file_url LIKE ?1",
+                params![needle],
+            )?;
+            Ok(pairs)
+        })
+        .await
+    }
 }
 
 fn msg_kind_str(k: MsgKind) -> &'static str {
@@ -774,7 +867,7 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<WireMsg> {
         id: r.get::<_, i64>(0)? as u64,
         channel: r.get::<_, String>(1)?.to_compact_string(),
         kind,
-        user_id: r.get::<_, Option<i64>>(2)?.map(|v| v as u32).unwrap_or(0),
+        user_id: r.get::<_, Option<String>>(2)?.unwrap_or_default().to_compact_string(),
         username: r.get::<_, String>(3)?.to_compact_string(),
         avatar: r.get::<_, String>(4)?.to_compact_string(),
         color: r.get::<_, String>(5)?.to_compact_string(),
@@ -810,6 +903,7 @@ impl Db {
         ts: u64,
     ) -> rusqlite::Result<bool> {
         let cid = channel.to_string();
+        let uid = user_id.to_string();
         let emoji_s = emoji.to_string();
         self.with(move |c| {
             let tx = c.transaction()?;
@@ -817,7 +911,7 @@ impl Db {
                 .query_row(
                     "SELECT 1 FROM reactions
                       WHERE message_id = ?1 AND user_id = ?2 AND emoji = ?3",
-                    params![message_id as i64, user_id, emoji_s],
+                    params![message_id as i64, uid, emoji_s],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -826,14 +920,14 @@ impl Db {
                 tx.execute(
                     "DELETE FROM reactions
                       WHERE message_id = ?1 AND user_id = ?2 AND emoji = ?3",
-                    params![message_id as i64, user_id, emoji_s],
+                    params![message_id as i64, uid, emoji_s],
                 )?;
                 now_on = false;
             } else {
                 tx.execute(
                     "INSERT INTO reactions(message_id, user_id, emoji, ts)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![message_id as i64, user_id, emoji_s, ts as i64],
+                    params![message_id as i64, uid, emoji_s, ts as i64],
                 )?;
                 now_on = true;
             }
@@ -844,7 +938,7 @@ impl Db {
                     ts as i64,
                     message_id as i64,
                     cid,
-                    user_id,
+                    uid,
                     emoji_s,
                     now_on as i64,
                 ],
@@ -869,7 +963,7 @@ impl Db {
                 Ok(ReactionRow {
                     channel_id: r.get::<_, String>(0)?.to_compact_string(),
                     message_id: r.get::<_, i64>(1)? as u64,
-                    user_id: r.get::<_, i64>(2)? as u32,
+                    user_id: r.get::<_, String>(2)?.to_compact_string(),
                     emoji: r.get::<_, String>(3)?.to_compact_string(),
                 })
             })?;
@@ -891,7 +985,7 @@ pub struct SessionEventRow {
     pub ts: u64,
     pub event: String,
     #[serde(rename = "userId")]
-    pub user_id: u32,
+    pub user_id: String,
     pub username: String,
     pub ip: String,
     #[serde(rename = "userAgent", default, skip_serializing_if = "String::is_empty")]
@@ -915,6 +1009,7 @@ impl Db {
         sockets: Option<u32>,
     ) -> rusqlite::Result<()> {
         let event = event.to_string();
+        let uid = user_id.to_string();
         let username = username.to_string();
         let ip = ip.to_string();
         let ua = user_agent.to_string();
@@ -925,7 +1020,7 @@ impl Db {
                 params![
                     ts as i64,
                     event,
-                    user_id,
+                    uid,
                     username,
                     ip,
                     ua,
@@ -949,7 +1044,7 @@ impl Db {
                     id: r.get(0)?,
                     ts: r.get::<_, i64>(1)? as u64,
                     event: r.get(2)?,
-                    user_id: r.get::<_, i64>(3)? as u32,
+                    user_id: r.get::<_, String>(3)?,
                     username: r.get(4)?,
                     ip: r.get(5)?,
                     user_agent: r.get(6)?,
@@ -1028,7 +1123,7 @@ pub struct UploadRow {
     pub mime: String,
     pub size: u64,
     #[serde(rename = "uploadedBy", skip_serializing_if = "Option::is_none")]
-    pub uploaded_by: Option<u32>,
+    pub uploaded_by: Option<String>,
     #[serde(rename = "uploadedByName")]
     pub uploaded_by_name: String,
     #[serde(rename = "uploadedAt")]
@@ -1050,6 +1145,7 @@ impl Db {
         let original_name = original_name.to_string();
         let mime = mime.to_string();
         let by_name = uploaded_by_name.to_string();
+        let uploaded_by = uploaded_by.map(|u| u.to_string());
         self.with(move |c| {
             c.execute(
                 "INSERT OR REPLACE INTO uploads(
@@ -1086,7 +1182,7 @@ impl Db {
                     original_name:   r.get(1)?,
                     mime:            r.get(2)?,
                     size:            r.get::<_, i64>(3)? as u64,
-                    uploaded_by:     r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                    uploaded_by:     r.get::<_, Option<String>>(4)?,
                     uploaded_by_name: r.get(5)?,
                     uploaded_at:     r.get::<_, i64>(6)? as u64,
                 })

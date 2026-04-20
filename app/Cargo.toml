@@ -62,6 +62,8 @@ arrayvec    = { version = "0.7", features = ["serde"] }
 uuid        = { version = "1", default-features = false, features = ["v4", "fast-rng", "serde"] }
 time        = { version = "0.3", default-features = false, features = ["std", "formatting", "serde"] }
 rand        = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+argon2      = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+password-hash = { version = "0.5", default-features = false, features = ["alloc", "rand_core"] }
 
 # Embedded static assets (the entire web/ folder)
 rust-embed  = { version = "8", features = ["compression"] }

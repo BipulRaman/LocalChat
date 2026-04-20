@@ -22,6 +22,39 @@ use crate::message::{now_secs, FileInfo, MsgKind, WireMsg};
 use crate::state::AppState;
 use crate::user::{UserId, UserInfo};
 
+/// What to do with a freshly-supplied password once the join has been
+/// validated. Decided pre-commit so the rest of the join logic can run
+/// without re-reading the DB.
+enum PasswordAction {
+    /// Existing row already has a hash that matched \u2014 nothing to write.
+    None,
+    /// Brand new user; hash and store as part of the create_user step.
+    SetForNew,
+    /// Row exists but had no hash yet (or we're back-filling it).
+    SetForExisting(UserId),
+}
+
+/// Argon2id over the supplied password with a fresh random salt.
+/// Returns the PHC-formatted string ready for storage.
+fn hash_password(plain: &str) -> Option<String> {
+    use argon2::{Argon2, PasswordHasher};
+    use password_hash::{rand_core::OsRng, SaltString};
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(plain.as_bytes(), &salt)
+        .ok()
+        .map(|h| h.to_string())
+}
+
+fn verify_password(plain: &str, stored_hash: &str) -> bool {
+    use argon2::{Argon2, PasswordVerifier};
+    use password_hash::PasswordHash;
+    let Ok(parsed) = PasswordHash::new(stored_hash) else { return false };
+    Argon2::default()
+        .verify_password(plain.as_bytes(), &parsed)
+        .is_ok()
+}
+
 pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, user_agent: String) {
     state.metrics.inc_connect();
     let (mut sink, mut stream) = socket.split();
@@ -41,6 +74,16 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         color: String,
         #[serde(default)]
         pubkey: String,
+        /// Previously assigned UserId echoed back from the browser's
+        /// localStorage. Reused when the supplied pubkey matches the row
+        /// stored on the server, otherwise discarded.
+        #[serde(default, rename = "userId")]
+        user_id: String,
+        /// Plain-text password supplied by the browser. Hashed
+        /// server-side and compared with the stored Argon2id hash.
+        /// First-time users (no row yet) get this hashed and stored.
+        #[serde(default)]
+        password: String,
     }
     let Ok(join) = serde_json::from_str::<Value>(&init).and_then(|v| {
         if v.get("op").and_then(Value::as_str) != Some("join") {
@@ -61,7 +104,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
     if username.is_empty() {
         let _ = sink
             .send(Message::Text(
-                r#"{"ev":"error","text":"invalid username"}"#.into(),
+                r#"{"ev":"error","text":"Username must be 3-24 chars: letters, digits, underscore, hyphen, or dot. No spaces.","code":"invalid_username"}"#.into(),
             ))
             .await;
         state.metrics.dec_connect();
@@ -84,40 +127,109 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         return;
     }
 
-    // ── Username ownership check ─────────────────────────────────────
-    // Once a username has been claimed by a browser (identified by its
-    // E2EE public key), only that same browser can re-use the name.
-    // Prevents trivial impersonation on a shared LAN.
-    let supplied_pub: CompactString = join.pubkey
-        .chars()
-        .take(512)
-        .collect::<String>()
-        .to_compact_string();
-    let key = username.to_lowercase().to_compact_string();
-    if let Some(existing_id) = state.username_to_id.get(&key).map(|v| *v) {
-        if let Some(prior) = state.known_users.get(&existing_id).map(|e| e.value().clone()) {
-            if !prior.pubkey.is_empty()
-                && (supplied_pub.is_empty() || supplied_pub != prior.pubkey)
-            {
+    // ── Password-based identity check ─────────────────────────────────
+    // Every user must supply a password. First-time signup creates the
+    // hash; returning users must present the same password. The password
+    // is the durable credential that lets a user move browsers and still
+    // reclaim their UserId, DM history, and group memberships.
+    if join.password.is_empty() || join.password.len() > 256 {
+        let _ = sink
+            .send(Message::Text(
+                json!({
+                    "ev":"error",
+                    "text":"Password is required.",
+                    "code":"password_required",
+                }).to_string(),
+            ))
+            .await;
+        state.metrics.dec_connect();
+        return;
+    }
+
+    // Look up any prior credentials row for this username.
+    let stored = state
+        .db
+        .find_user_credentials(&username)
+        .await
+        .ok()
+        .flatten();
+
+    // Decide whether this is a signup or a login, and on login verify
+    // the password before letting the join proceed. We do this BEFORE
+    // touching any in-memory state so a wrong password leaves nothing
+    // behind.
+    let mut password_action: PasswordAction = PasswordAction::None;
+    let mut forced_user_id: Option<UserId> = None;
+    match stored.as_ref() {
+        Some((existing_id, hash)) if !hash.is_empty() => {
+            if !verify_password(&join.password, hash) {
                 let _ = sink
                     .send(Message::Text(
                         json!({
                             "ev":"error",
-                            "text": format!(
-                                "Username \"{}\" is already taken on this server. Pick a different name.",
-                                username
-                            ),
-                            "code": "username_taken",
+                            "text":"Incorrect password for this username.",
+                            "code":"bad_password",
                         }).to_string(),
                     ))
                     .await;
                 state.metrics.dec_connect();
                 return;
             }
+            // Login OK \u2014 reuse the existing UserId regardless of what
+            // the browser sent in `userId`. This is what lets the same
+            // account log in from a brand-new browser.
+            forced_user_id = Some(existing_id.clone());
+        }
+        Some((existing_id, _)) => {
+            // Row exists but never had a password \u2014 first password is
+            // accepted as the new credential.
+            if join.password.len() < 4 {
+                let _ = sink
+                    .send(Message::Text(
+                        json!({
+                            "ev":"error",
+                            "text":"Password must be at least 4 characters.",
+                            "code":"password_weak",
+                        }).to_string(),
+                    ))
+                    .await;
+                state.metrics.dec_connect();
+                return;
+            }
+            forced_user_id = Some(existing_id.clone());
+            password_action = PasswordAction::SetForExisting(existing_id.clone());
+        }
+        None => {
+            // First-time signup. Enforce a minimum so the password is at
+            // least vaguely useful as a credential on a shared LAN.
+            if join.password.len() < 4 {
+                let _ = sink
+                    .send(Message::Text(
+                        json!({
+                            "ev":"error",
+                            "text":"Password must be at least 4 characters.",
+                            "code":"password_weak",
+                        }).to_string(),
+                    ))
+                    .await;
+                state.metrics.dec_connect();
+                return;
+            }
+            password_action = PasswordAction::SetForNew;
         }
     }
 
-    let user_id = assign_user_id(&state, &username);
+    let user_id = match forced_user_id {
+        Some(id) => {
+            // Make sure the in-memory map points at the canonical id so
+            // every subsequent lookup (DMs, presence) finds this user.
+            state
+                .username_to_id
+                .insert(username.to_lowercase().to_compact_string(), id.clone());
+            id
+        }
+        None => assign_user_id(&state, &username, &join.user_id),
+    };
 
     // Restore previous identity (avatar/color/pubkey) if this user has
     // connected before. Client-supplied values still win when provided.
@@ -153,7 +265,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
     };
 
     let info = UserInfo {
-        id: user_id,
+        id: user_id.clone(),
         username: username.clone(),
         avatar,
         color,
@@ -167,10 +279,10 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         last_connect: now_secs(),
         total_sessions: prior.as_ref().map(|p| p.total_sessions).unwrap_or(0) + 1,
     };
-    state.users.insert(user_id, info.clone());
-    state.known_users.insert(user_id, info.clone());
+    state.users.insert(user_id.clone(), info.clone());
+    state.known_users.insert(user_id.clone(), info.clone());
     let socket_count = {
-        let mut entry = state.connections.entry(user_id).or_insert(0);
+        let mut entry = state.connections.entry(user_id.clone()).or_insert(0);
         *entry += 1;
         *entry
     };
@@ -184,7 +296,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
     // Persistent audit trail — always append, every socket open.
     let _ = state.db.append_session_event(
         "connect",
-        user_id,
+        user_id.clone(),
         &info.username,
         &peer_ip,
         &user_agent,
@@ -198,21 +310,36 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
     // last_connect/total_sessions/last_ip and refresh avatar/color/pubkey.
     if prior.is_some() {
         let _ = state.db.touch_user_on_connect(
-            user_id, &info.avatar, &info.color, &info.pubkey,
+            user_id.clone(), &info.username, &info.avatar, &info.color, &info.pubkey,
             &peer_ip, session_started,
         ).await;
     } else {
         let _ = state.db.create_user(&info).await;
     }
 
+    // Persist the password hash for new signups (and back-fill rows
+    // that previously had no password). Decided pre-commit above.
+    match &password_action {
+        PasswordAction::SetForNew | PasswordAction::SetForExisting(_) => {
+            if let Some(hash) = hash_password(&join.password) {
+                let target_id = match &password_action {
+                    PasswordAction::SetForExisting(id) => id.clone(),
+                    _ => user_id.clone(),
+                };
+                let _ = state.db.set_password_hash(target_id, &hash).await;
+            }
+        }
+        PasswordAction::None => {}
+    }
+
     // Auto-join the lobby.
     let lobby = state.channels.get(LOBBY_ID).expect("lobby always exists");
-    lobby.members.insert(user_id);
-    state.channels.add_user_channel(user_id, &lobby.id);
+    lobby.members.insert(user_id.clone());
+    state.channels.add_user_channel(user_id.clone(), &lobby.id);
 
     // Re-bind any DM channels that contain this username so they survive
     // page reloads (DMs are keyed by username hash, members are ephemeral).
-    let rebound_dms = state.channels.rebind_user_dms(user_id, &info.username);
+    let rebound_dms = state.channels.rebind_user_dms(user_id.clone(), &info.username);
 
     // Re-subscribe to every group channel this user is already a member
     // of (membership is now durable across reloads & restarts).
@@ -221,7 +348,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         let ch = entry.value();
         if matches!(ch.kind, ChannelKind::Lobby | ChannelKind::Dm) { continue; }
         if ch.members.contains(&user_id) {
-            state.channels.add_user_channel(user_id, &ch.id);
+            state.channels.add_user_channel(user_id.clone(), &ch.id);
             my_channels.push(ch.id.clone());
         }
     }
@@ -249,12 +376,12 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         .simple()
         .to_string()
         .to_compact_string();
-    state.sessions.insert(session_token.clone(), user_id);
+    state.sessions.insert(session_token.clone(), user_id.clone());
 
     let welcome = json!({
         "ev": "welcome",
         "user": info,
-        "channels": state.channels.visible_to(user_id),
+        "channels": state.channels.visible_to(user_id.clone()),
         "users": state.users.iter().map(|e| e.value().clone()).collect::<Vec<_>>(),
         "lobby": LOBBY_ID,
         "session": session_token,
@@ -329,7 +456,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
                 let Some(Ok(msg)) = incoming else { break };
                 match msg {
                     Message::Text(txt) => {
-                        if let Err(e) = handle_op(&state, user_id, &mut sink, &mut rxs, &mut own_channels, &txt).await {
+                        if let Err(e) = handle_op(&state, user_id.clone(), &mut sink, &mut rxs, &mut own_channels, &txt).await {
                             let _ = sink.send(Message::Text(
                                 json!({"ev":"error","text":e}).to_string())).await;
                         }
@@ -349,7 +476,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
                         // do NOT forward it to the client.
                         if msg.username == "__dm_subscribe" {
                             if let Ok(v) = serde_json::from_str::<Value>(&msg.text) {
-                                let target = v.get("forUserId").and_then(Value::as_u64).unwrap_or(0) as UserId;
+                                let target = v.get("forUserId").and_then(Value::as_str).unwrap_or("").to_compact_string();
                                 if target == user_id {
                                     if let Some(ch_id) = v.get("channel").and_then(Value::as_str) {
                                         let cid = ch_id.to_compact_string();
@@ -373,7 +500,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
                         // it in the sidebar, and tell the client to toast.
                         if msg.username == "__ch_invited" {
                             if let Ok(v) = serde_json::from_str::<Value>(&msg.text) {
-                                let target = v.get("forUserId").and_then(Value::as_u64).unwrap_or(0) as UserId;
+                                let target = v.get("forUserId").and_then(Value::as_str).unwrap_or("").to_compact_string();
                                 if target == user_id {
                                     if let Some(ch_id) = v.get("channel").and_then(Value::as_str) {
                                         let cid = ch_id.to_compact_string();
@@ -417,7 +544,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
 async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_started: u64) {
     // Decrement socket count; only fully "leave" when it hits zero.
     let (still_online, sockets_remaining) = {
-        let mut entry = state.connections.entry(user_id).or_insert(0);
+        let mut entry = state.connections.entry(user_id.clone()).or_insert(0);
         if *entry > 0 { *entry -= 1; }
         let n = *entry;
         let still = n > 0;
@@ -443,7 +570,7 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_
         // Always record the per-socket disconnect in the audit log.
         let _ = state.db.append_session_event(
             "disconnect",
-            user_id,
+            user_id.clone(),
             &username_for_audit,
             peer_ip,
             "",
@@ -458,7 +585,7 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_
             k.last_seen = now;
             k.last_ip = peer_ip.to_compact_string();
         }
-        let _ = state.db.update_user_on_disconnect(user_id, peer_ip, now).await;
+        let _ = state.db.update_user_on_disconnect(user_id.clone(), peer_ip, now).await;
     }
 
     if still_online {
@@ -543,24 +670,54 @@ async fn cleanup(state: &Arc<AppState>, user_id: UserId, peer_ip: &str, session_
 /// server restarts (loaded from users.json). Multiple concurrent sockets
 /// for the same username share the same UserId; the connection ref-count
 /// in `state.connections` decides when the user truly goes offline.
-fn assign_user_id(state: &Arc<AppState>, username: &CompactString) -> UserId {
+fn assign_user_id(
+    state: &Arc<AppState>,
+    username: &CompactString,
+    client_hint: &str,
+) -> UserId {
     let key = username.to_lowercase().to_compact_string();
-    if let Some(existing) = state.username_to_id.get(&key).map(|v| *v) {
+    if let Some(existing) = state.username_to_id.get(&key).map(|v| v.value().clone()) {
         return existing;
     }
-    let id = state.next_user_id();
-    state.username_to_id.insert(key, id);
+    // Honour the client's stored UserId (from localStorage) when it looks
+    // sane, otherwise mint a fresh UUID. This keeps a returning user's
+    // id stable across server restarts even when the in-memory username
+    // map was cleared, while still rejecting collisions and impersonation
+    // attempts via the pubkey check upstream.
+    let id: UserId = if is_valid_user_id(client_hint)
+        && !state.known_users.contains_key(&client_hint.to_compact_string())
+    {
+        client_hint.to_compact_string()
+    } else {
+        uuid::Uuid::new_v4().simple().to_string().to_compact_string()
+    };
+    state.username_to_id.insert(key, id.clone());
     id
 }
 
+/// Accept only short hex UUIDs (32 chars, lowercase hex) coming from the
+/// browser. Anything else is treated as untrusted noise and discarded.
+fn is_valid_user_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Enforce strict username rules: ASCII letters, digits, underscore,
+/// hyphen, or dot; 3–24 chars; must start with a letter or digit. Returns
+/// an empty string when the input doesn't qualify so the caller can
+/// reject the join with the standard "invalid username" error.
 fn sanitize_username(u: &str) -> CompactString {
-    let cleaned: String = u
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(30)
-        .collect();
-    cleaned.to_compact_string()
+    let trimmed = u.trim();
+    if trimmed.len() < 3 || trimmed.len() > 24 {
+        return CompactString::const_new("");
+    }
+    let bytes = trimmed.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return CompactString::const_new("");
+    }
+    if !bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+        return CompactString::const_new("");
+    }
+    trimmed.to_compact_string()
 }
 
 /// Stable color from a username (case-insensitive, FNV-1a 32-bit hash).
@@ -640,7 +797,7 @@ async fn broadcast_system(state: &Arc<AppState>, ch: &Channel, text: &str) {
         id: state.next_msg_id(),
         channel: ch.id.clone(),
         kind: MsgKind::System,
-        user_id: 0,
+        user_id: CompactString::const_new(""),
         username: CompactString::const_new(""),
         avatar: CompactString::const_new(""),
         color: CompactString::const_new(""),
@@ -672,7 +829,7 @@ async fn broadcast_users(state: &Arc<AppState>) {
             id: 0,
             channel: lobby.id.clone(),
             kind: MsgKind::System,
-            user_id: 0,
+            user_id: CompactString::const_new(""),
             username: CompactString::const_new("__presence"),
             avatar: CompactString::const_new(""),
             color: CompactString::const_new(""),
@@ -720,7 +877,7 @@ async fn handle_op(
                 return Err("empty or oversize text".into());
             }
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) {
+            if !can_send(&ch, &user_id) {
                 return Err("not a member".into());
             }
             let user = state.users.get(&user_id).ok_or("user gone")?.clone();
@@ -728,7 +885,7 @@ async fn handle_op(
                 id: state.next_msg_id(),
                 channel: channel_id.clone(),
                 kind: MsgKind::Text,
-                user_id,
+                user_id: user_id.clone(),
                 username: user.username.clone(),
                 avatar: user.avatar.clone(),
                 color: user.color.clone(),
@@ -744,7 +901,7 @@ async fn handle_op(
                 crate::applog::log(format_args!("db.insert_message FAILED (send): {e}"));
             }
             state.metrics.inc_messages();
-            bump_user_msg_count(state, user_id);
+            bump_user_msg_count(state, user_id.clone());
             let _ = state.db.bump_user_msg_count(user_id).await;
             let _ = ch.tx.send(msg);
         }
@@ -760,7 +917,7 @@ async fn handle_op(
             )
             .map_err(|e| e.to_string())?;
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) {
+            if !can_send(&ch, &user_id) {
                 return Err("not a member".into());
             }
             // Idempotency: if the client retried this op (e.g. after a
@@ -780,7 +937,7 @@ async fn handle_op(
                 id: state.next_msg_id(),
                 channel: channel_id.clone(),
                 kind: MsgKind::File,
-                user_id,
+                user_id: user_id.clone(),
                 username: user.username.clone(),
                 avatar: user.avatar.clone(),
                 color: user.color.clone(),
@@ -817,7 +974,7 @@ async fn handle_op(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let ch = state.channels.get(channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) {
+            if !can_send(&ch, &user_id) {
                 return Ok(()); // silently ignore
             }
             let user = state
@@ -828,7 +985,7 @@ async fn handle_op(
             let ev = json!({
                 "ev": "typing",
                 "channel": channel_id,
-                "userId": user_id,
+                "userId": user_id.as_str(),
                 "username": user,
                 "typing": is_typing,
             });
@@ -860,7 +1017,7 @@ async fn handle_op(
                 return Err("empty name".into());
             }
             let private = v.get("private").and_then(Value::as_bool).unwrap_or(false);
-            let ch = state.channels.create_group(name, private, user_id);
+            let ch = state.channels.create_group(name, private, user_id.clone());
             rxs.push(ch.tx.subscribe());
             own_channels.push(ch.id.clone());
 
@@ -880,8 +1037,8 @@ async fn handle_op(
             if ch.is_private && !ch.members.contains(&user_id) {
                 return Err("channel is private".into());
             }
-            ch.members.insert(user_id);
-            state.channels.add_user_channel(user_id, &ch.id);
+            ch.members.insert(user_id.clone());
+            state.channels.add_user_channel(user_id.clone(), &ch.id);
             if !own_channels.iter().any(|c| c == &ch.id) {
                 rxs.push(ch.tx.subscribe());
                 own_channels.push(ch.id.clone());
@@ -906,7 +1063,7 @@ async fn handle_op(
             }
             if let Some(ch) = state.channels.get(id) {
                 ch.members.remove(&user_id);
-                state.channels.remove_user_channel(user_id, id);
+                state.channels.remove_user_channel(user_id.clone(), id);
                 own_channels.retain(|c| c != id);
                 // rxs: we don't bother surgically removing; the send loop
                 // will drop the receiver when the channel empties or the
@@ -935,11 +1092,11 @@ async fn handle_op(
                 .unwrap_or_default();
             let mut added: Vec<(UserId, String)> = Vec::new();
             for u in users {
-                if let Some(uid) = u.as_u64() {
-                    let uid = uid as UserId;
+                if let Some(s) = u.as_str() {
+                    let uid = s.to_compact_string();
                     if uid == user_id { continue; }
-                    let was_new = ch.members.insert(uid);
-                    state.channels.add_user_channel(uid, &ch.id);
+                    let was_new = ch.members.insert(uid.clone());
+                    state.channels.add_user_channel(uid.clone(), &ch.id);
                     if was_new {
                         let name = state
                             .users
@@ -958,7 +1115,7 @@ async fn handle_op(
                         let payload = json!({
                             "ev": "ch_invited",
                             "channel": ch.id,
-                            "forUserId": *uid,
+                            "forUserId": uid.as_str(),
                             "inviter": inviter_name,
                             "channelName": ch.name,
                         });
@@ -966,7 +1123,7 @@ async fn handle_op(
                             id: 0,
                             channel: lobby.id.clone(),
                             kind: MsgKind::System,
-                            user_id,
+                            user_id: user_id.clone(),
                             username: CompactString::const_new("__ch_invited"),
                             avatar: CompactString::const_new(""),
                             color: CompactString::const_new(""),
@@ -996,14 +1153,14 @@ async fn handle_op(
                 }
                 let now = now_secs();
                 for (uid, _) in &added {
-                    let _ = state.db.add_member(&ch.id, *uid, now).await;
+                    let _ = state.db.add_member(&ch.id, uid.clone(), now).await;
                 }
             }
         }
 
         "dm_open" => {
-            let peer = v.get("user").and_then(Value::as_u64).ok_or("missing user")?
-                as UserId;
+            let peer = v.get("user").and_then(Value::as_str).ok_or("missing user")?
+                .to_compact_string();
             if peer == user_id {
                 return Err("cannot DM yourself".into());
             }
@@ -1013,7 +1170,7 @@ async fn handle_op(
             let peer_name = state.users.get(&peer)
                 .map(|e| e.value().username.to_string())
                 .ok_or("peer gone")?;
-            let ch = state.channels.open_dm(user_id, &my_name, peer, &peer_name);
+            let ch = state.channels.open_dm(user_id.clone(), &my_name, peer.clone(), &peer_name);
             if !own_channels.iter().any(|c| c == &ch.id) {
                 rxs.push(ch.tx.subscribe());
                 own_channels.push(ch.id.clone());
@@ -1029,13 +1186,13 @@ async fn handle_op(
                 let payload = json!({
                     "ev": "dm_subscribe",
                     "channel": ch.id,
-                    "forUserId": peer,
+                    "forUserId": peer.as_str(),
                 });
                 let _ = lobby.tx.send(Arc::new(WireMsg {
                     id: 0,
                     channel: lobby.id.clone(),
                     kind: MsgKind::System,
-                    user_id,
+                    user_id: user_id.clone(),
                     username: CompactString::const_new("__dm_subscribe"),
                     avatar: CompactString::const_new(""),
                     color: CompactString::const_new(""),
@@ -1048,7 +1205,7 @@ async fn handle_op(
                 }));
             }
             let _ = state.db.upsert_channel(&ch.meta()).await;
-            let _ = state.db.add_member(&ch.id, user_id, now_secs()).await;
+            let _ = state.db.add_member(&ch.id, user_id.clone(), now_secs()).await;
             let _ = state.db.add_member(&ch.id, peer, now_secs()).await;
         }
 
@@ -1068,7 +1225,7 @@ async fn handle_op(
                 id: 0,
                 channel: id_str.clone(),
                 kind: MsgKind::System,
-                user_id,
+                user_id: user_id.clone(),
                 username: CompactString::const_new("__dm_deleted"),
                 avatar: CompactString::const_new(""),
                 color: CompactString::const_new(""),
@@ -1168,7 +1325,7 @@ async fn handle_op(
             if emoji.is_empty() { return Err("empty emoji".into()); }
 
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) {
+            if !can_send(&ch, &user_id) {
                 return Err("not a member".into());
             }
 
@@ -1181,7 +1338,7 @@ async fn handle_op(
                     users.swap_remove(pos);
                     on = false;
                 } else {
-                    users.push(user_id);
+                    users.push(user_id.clone());
                 }
                 if users.is_empty() {
                     drop(users);
@@ -1198,7 +1355,7 @@ async fn handle_op(
             // performs its own toggle and writes a row in `reactions` +
             // appends an audit row in `reaction_events`.
             let _ = state.db.toggle_reaction(
-                &channel_id, msg_id, user_id, &emoji, now_secs(),
+                &channel_id, msg_id, user_id.clone(), &emoji, now_secs(),
             ).await;
 
             let username = state
@@ -1210,7 +1367,7 @@ async fn handle_op(
                 "ev": "react",
                 "channel": channel_id,
                 "msgId": msg_id,
-                "userId": user_id,
+                "userId": user_id.as_str(),
                 "username": username,
                 "emoji": emoji,
                 "on": on,
@@ -1251,7 +1408,7 @@ async fn handle_op(
                 return Err("invalid call kind".into());
             }
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) { return Err("not a member".into()); }
+            if !can_send(&ch, &user_id) { return Err("not a member".into()); }
             // Only allow on DM channels — group calls aren't supported.
             if !matches!(ch.kind, ChannelKind::Dm) {
                 return Err("calls only allowed in DMs".into());
@@ -1272,9 +1429,9 @@ async fn handle_op(
                     let callee_id = ch
                         .members
                         .iter()
-                        .map(|e| *e)
+                        .map(|e| e.clone())
                         .find(|uid| *uid != user_id)
-                        .unwrap_or(0);
+                        .unwrap_or_else(|| CompactString::const_new(""));
                     let callee_name = state
                         .users
                         .get(&callee_id)
@@ -1288,7 +1445,7 @@ async fn handle_op(
                     state.calls.insert(
                         channel_id.clone(),
                         crate::state::CallSession {
-                            caller_id: user_id,
+                            caller_id: user_id.clone(),
                             caller_name: username.to_compact_string(),
                             callee_id,
                             callee_name: callee_name.to_compact_string(),
@@ -1350,7 +1507,7 @@ async fn handle_op(
                 "ev": "call",
                 "channel": channel_id,
                 "kind": kind,
-                "from": user_id,
+                "from": user_id.as_str(),
                 "fromName": username,
                 "payload": v.get("payload").cloned().unwrap_or(Value::Null),
             });
@@ -1379,7 +1536,7 @@ async fn handle_op(
                 .to_compact_string();
             let msg_id = v.get("msgId").and_then(Value::as_u64).ok_or("missing msgId")?;
             let ch = state.channels.get(&channel_id).ok_or("no such channel")?;
-            if !can_send(&ch, user_id) { return Err("not a member".into()); }
+            if !can_send(&ch, &user_id) { return Err("not a member".into()); }
             let username = state
                 .users
                 .get(&user_id)
@@ -1415,8 +1572,8 @@ async fn handle_op(
     Ok(())
 }
 
-fn can_send(ch: &Channel, user: UserId) -> bool {
-    matches!(ch.kind, ChannelKind::Lobby) || ch.members.contains(&user)
+fn can_send(ch: &Channel, user: &UserId) -> bool {
+    matches!(ch.kind, ChannelKind::Lobby) || ch.members.contains(user)
 }
 
 fn bump_user_msg_count(state: &Arc<AppState>, user_id: UserId) {

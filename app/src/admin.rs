@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use compact_str::{CompactString, ToCompactString};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -137,7 +138,7 @@ async fn users(
 #[derive(Deserialize)]
 struct SessionsQuery {
     limit: Option<usize>,
-    user: Option<u32>,
+    user: Option<String>,
 }
 
 async fn sessions(
@@ -150,7 +151,7 @@ async fn sessions(
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let mut events = state.db.tail_session_events(limit).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Some(uid) = q.user {
+    if let Some(uid) = q.user.as_deref() {
         events.retain(|e| e.user_id == uid);
     }
     // Newest first for display.
@@ -242,9 +243,10 @@ async fn kick(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Path(user_id): Path<u32>,
+    Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
+    let user_id = user_id.to_compact_string();
     let existed = state.users.remove(&user_id).is_some();
     // Drop the persisted identity too so /users no longer lists them.
     state.known_users.remove(&user_id);
@@ -258,9 +260,9 @@ async fn kick(
     }
     state.connections.remove(&user_id);
     // Actively disconnect every live socket for this user.
-    let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id));
-    let _ = state.db.delete_user(user_id).await;
-    let _ = state.db.log_admin("kick", &addr.ip().to_string(), &user_id.to_string(), "").await;
+    let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id.clone()));
+    let _ = state.db.delete_user(user_id.clone()).await;
+    let _ = state.db.log_admin("kick", &addr.ip().to_string(), &user_id, "").await;
     Ok(Json(json!({"ok": existed})))
 }
 
@@ -268,9 +270,10 @@ async fn ban(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Path(user_id): Path<u32>,
+    Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth!(state, headers, addr);
+    let user_id = user_id.to_compact_string();
     let to_ban = state.users.get(&user_id).map(|u| (u.username.to_string(), u.ip.to_string()));
     let Some((username, ip)) = to_ban else {
         return Err((StatusCode::NOT_FOUND, "no such user".into()));
@@ -289,7 +292,7 @@ async fn ban(
     if !ip.is_empty() {
         let _ = state.db.add_ban("ip", &ip, "admin ban", now).await;
     }
-    let _ = state.db.log_admin("ban", &addr.ip().to_string(), &user_id.to_string(), &username).await;
+    let _ = state.db.log_admin("ban", &addr.ip().to_string(), &user_id, &username).await;
     state.users.remove(&user_id);
     // Actively boot the banned user's open sockets.
     let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id));
@@ -335,7 +338,7 @@ async fn broadcast(
         id: state.next_msg_id(),
         channel: ch.id.clone(),
         kind: MsgKind::System,
-        user_id: 0,
+        user_id: CompactString::const_new(""),
         username: CompactString::const_new("admin"),
         avatar: CompactString::const_new(""),
         color: CompactString::const_new("#ef4444"),
@@ -377,7 +380,7 @@ async fn delete_channel(
             id: 0,
             channel: cid.clone(),
             kind: MsgKind::System,
-            user_id: 0,
+            user_id: CompactString::const_new(""),
             username: CompactString::from(marker),
             avatar: CompactString::const_new(""),
             color: CompactString::const_new(""),
@@ -448,11 +451,49 @@ async fn delete_upload(
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let path = state.uploads_dir.join(safe);
-    tokio::fs::remove_file(path)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // Best-effort: even if the file is already gone from disk, we still
+    // want to scrub the DB index + chat references so the UI is consistent.
+    let disk_removed = tokio::fs::remove_file(&path).await.is_ok();
+
+    // 1. Drop the uploads-index row.
     let _ = state.db.delete_upload(safe).await;
+    // 2. Rewrite every chat message that pointed at this file.
+    let pairs = state.db.purge_upload_refs(safe).await.unwrap_or_default();
+    // 3. Tell every live socket so the chat updates without a reload.
+    if !pairs.is_empty() {
+        use crate::message::{now_secs, MsgKind, WireMsg};
+        use std::collections::BTreeMap;
+        let mut by_channel: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (ch, mid) in pairs {
+            by_channel.entry(ch).or_default().push(mid);
+        }
+        let now = now_secs();
+        for (ch_id, ids) in by_channel {
+            if let Some(ch) = state.channels.get(&ch_id) {
+                let payload = json!({ "channel": ch_id, "ids": ids }).to_string();
+                let _ = ch.tx.send(Arc::new(WireMsg {
+                    id: 0,
+                    channel: ch_id.as_str().into(),
+                    kind: MsgKind::System,
+                    user_id: CompactString::const_new(""),
+                    username: "__media_deleted".into(),
+                    avatar: "".into(),
+                    color: "".into(),
+                    ts: now,
+                    text: payload,
+                    file: None,
+                    reply_to: None,
+                    edited_at: None,
+                    deleted: false,
+                }));
+            }
+        }
+    }
     let _ = state.db.log_admin("delete_upload", &addr.ip().to_string(), safe, "").await;
+    if !disk_removed {
+        // The file was already gone — surface that, but the cleanup
+        // above still happened so the response is "ok".
+    }
     Ok(Json(json!({"ok": true})))
 }
 
@@ -647,7 +688,7 @@ async fn reset(
             id: 0,
             channel: lobby.id.clone(),
             kind: MsgKind::System,
-            user_id: 0,
+            user_id: CompactString::const_new(""),
             username: CompactString::const_new("admin"),
             avatar: CompactString::const_new(""),
             color: CompactString::const_new("#ef4444"),
@@ -677,11 +718,10 @@ async fn reset(
         ChannelKind::Lobby,
         CompactString::const_new(LOBBY_NAME),
         false,
-        0,
+        CompactString::const_new(""),
         state.channels.history_cap,
     );
     state.channels.map.insert(lobby.id.clone(), Arc::new(lobby));
-    state.next_user_id.store(1, Ordering::Relaxed);
     state.next_msg_id.store(1, Ordering::Relaxed);
 
     // 4. Force every live socket to close so clients reconnect against
@@ -764,8 +804,6 @@ async fn reset_users(
     }
     state.channels.user_channels.clear();
 
-    state.next_user_id.store(1, Ordering::Relaxed);
-
     // Boot every live socket first so users get logged out immediately.
     // The cleanup() path is gated by `state.resetting`, so no fresh
     // disconnect rows are written into session_events.
@@ -810,7 +848,7 @@ async fn reset_channels(
             id: 0,
             channel: lobby.id.clone(),
             kind: MsgKind::System,
-            user_id: 0,
+            user_id: CompactString::const_new(""),
             username: CompactString::const_new("admin"),
             avatar: CompactString::const_new(""),
             color: CompactString::const_new("#ef4444"),
@@ -836,7 +874,7 @@ async fn reset_channels(
         ChannelKind::Lobby,
         CompactString::const_new(LOBBY_NAME),
         false,
-        0,
+        CompactString::const_new(""),
         state.channels.history_cap,
     );
     state.channels.map.insert(lobby.id.clone(), Arc::new(lobby));

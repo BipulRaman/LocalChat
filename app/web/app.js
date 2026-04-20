@@ -314,6 +314,22 @@ function unb64(s) {
 // can use them transparently. Misses fetch+decrypt once and memoize.
 const _e2eeBlobUrlCache = new Map();
 const _e2eeBlobUrlPending = new Map();
+// Replace an attachment node's contents with a "Media deleted" placeholder.
+// Used when the underlying file on disk is gone (HTTP 404 from /uploads/...)
+// or when E2EE decrypt can't run because the ciphertext has been wiped.
+function showMediaDeleted(att, realName) {
+  if (!att || att.dataset.deleted === "1") return;
+  att.dataset.deleted = "1";
+  att.classList.add("att-deleted");
+  att.replaceChildren(el("div", { class: "file deleted-file", title: "The original file is no longer on the server." }, [
+    el("div", { class: "file-icon" }, "✕"),
+    el("div", { class: "file-meta" }, [
+      el("div", { class: "file-name" }, realName || "Media"),
+      el("div", { class: "file-sub" }, "Media deleted"),
+    ]),
+  ]));
+}
+
 async function getDecryptedBlobUrl(storageName, fetchUrl, envelope, peer) {
   if (_e2eeBlobUrlCache.has(storageName)) return _e2eeBlobUrlCache.get(storageName);
   if (_e2eeBlobUrlPending.has(storageName)) return _e2eeBlobUrlPending.get(storageName);
@@ -384,11 +400,13 @@ const S = {
   // own scroll-into-view behaviour and left the composer stranded mid-
   // viewport. `dvh` is simpler and more reliable.
 
-  // Auto-rejoin if we previously chose a username on this device.
+  // Pre-fill the saved username, but never auto-connect: every join now
+  // requires a password supplied by the user.
   const saved = lstore.get("username");
   if (saved) {
     $("username").value = saved;
-    connect(saved);
+    const pw = $("password");
+    if (pw) pw.focus();
   }
 })();
 
@@ -396,12 +414,33 @@ const S = {
 $("joinForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const username = $("username").value.trim();
+  const password = $("password").value;
   if (!username) return;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,23}$/.test(username)) {
+    const status = $("joinStatus");
+    if (status) {
+      status.textContent = "Username must be 3-24 chars: letters, digits, underscore, hyphen, or dot. No spaces.";
+      status.classList.add("err");
+    }
+    const input = $("username");
+    if (input) { input.classList.add("err"); input.focus(); }
+    return;
+  }
+  if (!password || password.length < 4) {
+    const status = $("joinStatus");
+    if (status) {
+      status.textContent = "Password must be at least 4 characters.";
+      status.classList.add("err");
+    }
+    const pw = $("password");
+    if (pw) { pw.classList.add("err"); pw.focus(); }
+    return;
+  }
   lstore.set("username", username);
-  connect(username);
+  connect(username, password);
 });
 
-function connect(username) {
+function connect(username, password) {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
   S.ws = ws;
@@ -411,6 +450,8 @@ function connect(username) {
     ws.send(JSON.stringify({
       op: "join",
       username,
+      password: password || "",
+      userId: lstore.get("userId") || "",
       pubkey: E2EE.myPubStr(),
     }));
     // Drain anything that was queued while the socket was down.
@@ -422,7 +463,7 @@ function connect(username) {
     if (S.me) {
       S.reconnectTries += 1;
       setStatus("warn", "reconnecting…");
-      setTimeout(() => connect(S.me.username), Math.min(6000, 400 * S.reconnectTries));
+      setTimeout(() => connect(S.me.username, password), Math.min(6000, 400 * S.reconnectTries));
     } else {
       const status = $("joinStatus");
       // If the server already pushed a specific error (e.g. username taken),
@@ -485,7 +526,11 @@ function onError(e) {
     // Server rejected our auto-join (banned, bad name, name taken, etc.).
     // Drop the saved name so the user can pick a different one, surface
     // the message in the join screen, and stop the reconnect loop.
-    lstore.remove("username");
+    // Wrong-password and password-required errors leave the username
+    // alone so the user can just retype their password.
+    if (e.code !== "bad_password" && e.code !== "password_required" && e.code !== "password_weak") {
+      lstore.remove("username");
+    }
     const status = $("joinStatus");
     if (status) {
       status.textContent = e.text || "Could not join.";
@@ -502,6 +547,17 @@ function onError(e) {
           if (status) { status.textContent = ""; status.classList.remove("err"); }
         }, { once: true });
       }
+    } else if (e.code === "bad_password" || e.code === "password_required" || e.code === "password_weak") {
+      const pw = $("password");
+      if (pw) {
+        pw.value = "";
+        pw.focus();
+        pw.classList.add("err");
+        pw.addEventListener("input", () => {
+          pw.classList.remove("err");
+          if (status) { status.textContent = ""; status.classList.remove("err"); }
+        }, { once: true });
+      }
     }
     // Close the socket so the onclose handler doesn't try to reconnect
     // with the same rejected name.
@@ -515,6 +571,10 @@ function onWelcome(e) {
   S.me = e.user;
   S.session = e.session || null;
   S.reconnectTries = 0;
+  // Persist the server-issued UserId so a future reconnect (or a brand
+  // new browser, after the user re-enters their password) can echo it
+  // back and reclaim the same identity.
+  try { if (S.me && S.me.id) lstore.set("userId", S.me.id); } catch {}
   setStatus("ok", "online");
 
   S.channels.clear();
@@ -536,7 +596,6 @@ function onWelcome(e) {
     el("div", { class: "avatar xs", style: `background:${e.user.color}` }, e.user.avatar || "?"),
     el("div", { class: "me-info" }, [
       el("div", { class: "name" }, e.user.username),
-      el("div", { class: "id" }, `#${e.user.id}`),
     ]),
     el("button", {
       id: "themeToggle",
@@ -608,6 +667,13 @@ async function onWireMsg(m) {
     try {
       const id = JSON.parse(m.text).channel || m.channel;
       onChannelDeleted(id);
+    } catch {}
+    return;
+  }
+  if (m.username === "__media_deleted") {
+    try {
+      const { channel, ids } = JSON.parse(m.text);
+      onMediaDeleted(channel || m.channel, Array.isArray(ids) ? ids : []);
     } catch {}
     return;
   }
@@ -748,6 +814,35 @@ function onChannelDeleted(id) {
     else { S.active = null; renderStream(); updateHeader(); }
   }
   renderChannels();
+}
+
+// Admin deleted a media file. Patch every cached message in the given
+// channel that referenced it: drop the file payload and flip it to a
+// system-style "media deleted" marker, matching what the server now
+// stores in the DB. If the channel is open we re-render so the change
+// is visible immediately, no reload required.
+function onMediaDeleted(channel, ids) {
+  if (!channel || !ids || !ids.length) return;
+  const arr = S.msgs.get(channel);
+  if (!arr || !arr.length) return;
+  const idSet = new Set(ids.map(Number));
+  let touched = false;
+  for (let i = 0; i < arr.length; i++) {
+    const m = arr[i];
+    if (!idSet.has(Number(m.id))) continue;
+    arr[i] = {
+      ...m,
+      kind: "system",
+      text: "🗑️ Media deleted by admin",
+      file: null,
+      deleted: true,
+    };
+    touched = true;
+  }
+  if (touched && channel === S.active) {
+    $("messages").dataset.activeChannel = "__force";
+    renderStream();
+  }
 }
 
 function onTyping({ channel, userId, username, typing }) {
@@ -1271,7 +1366,9 @@ async function renderMessage(m, { follow, peer, ch }) {
 
     // For E2EE attachments, swap viewUrl/dlUrl for blob URLs after
     // decrypt completes. We start with a placeholder src and patch it
-    // in once the bytes are ready.
+    // in once the bytes are ready. If the source file has been deleted
+    // from the data folder, swap the attachment for a "Media deleted"
+    // placeholder instead.
     const finalize = async (mediaEl, downloadAnchors) => {
       if (!envelope) return;
       try {
@@ -1284,11 +1381,17 @@ async function renderMessage(m, { follow, peer, ch }) {
         }
       } catch (err) {
         console.warn("e2ee file decrypt failed", err);
+        showMediaDeleted(att, realName);
       }
     };
 
     if (isImg) {
-      const img = el("img", { src: envelope ? "" : viewUrl, alt: realName, loading: "lazy" });
+      const img = el("img", {
+        src: envelope ? "" : viewUrl,
+        alt: realName,
+        loading: "lazy",
+        onerror: () => { if (!envelope) showMediaDeleted(att, realName); },
+      });
       const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
       const wrap = el("div", { class: "image-att", title: "Click to expand" }, [
         img,
@@ -1298,6 +1401,7 @@ async function renderMessage(m, { follow, peer, ch }) {
         ]),
       ]);
       wrap.addEventListener("click", async () => {
+        if (att.dataset.deleted === "1") return;
         if (envelope) {
           const url = await getDecryptedBlobUrl(f.filename, viewUrl, envelope, peer);
           if (url) openLightbox(url, realName, url);
@@ -1314,6 +1418,7 @@ async function renderMessage(m, { follow, peer, ch }) {
         preload: "metadata",
         playsinline: "",
         onclick: (e) => e.stopPropagation(),
+        onerror: () => { if (!envelope) showMediaDeleted(att, realName); },
       });
       const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
       att.append(el("div", { class: "video-att" }, [
@@ -1330,6 +1435,7 @@ async function renderMessage(m, { follow, peer, ch }) {
         controls: "",
         preload: "metadata",
         onclick: (e) => e.stopPropagation(),
+        onerror: () => { if (!envelope) showMediaDeleted(att, realName); },
       });
       const dlA = el("a", { href: envelope ? "" : dlUrl, onclick: (e) => e.stopPropagation() }, "Download");
       att.append(el("div", { class: "audio-att" }, [
@@ -1345,6 +1451,21 @@ async function renderMessage(m, { follow, peer, ch }) {
         class: "file", href: envelope ? "" : dlUrl,
         target: envelope ? undefined : "_blank",
         rel: "noopener",
+        onclick: async (e) => {
+          if (att.dataset.deleted === "1") { e.preventDefault(); return; }
+          if (envelope) return; // blob URL is ready or finalize handled errors
+          // Probe the source so we can show "Media deleted" if it's gone.
+          try {
+            const res = await fetch(viewUrl, { method: "HEAD" });
+            if (!res.ok) {
+              e.preventDefault();
+              showMediaDeleted(att, realName);
+            }
+          } catch {
+            e.preventDefault();
+            showMediaDeleted(att, realName);
+          }
+        },
       }, [
         el("div", { class: "file-icon" }, fileExt(realName)),
         el("div", { class: "file-meta" }, [

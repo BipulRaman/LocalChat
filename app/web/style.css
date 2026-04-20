@@ -866,6 +866,17 @@ input:focus, textarea:focus {
 .bubble .attachment {
   display: flex; flex-direction: column;
 }
+/* "Media deleted" placeholder shown when the file is gone from disk. */
+.bubble .attachment.att-deleted .deleted-file {
+  cursor: default;
+  opacity: 0.75;
+  font-style: italic;
+}
+.bubble .attachment.att-deleted .deleted-file .file-icon {
+  background: rgba(255, 80, 80, 0.18);
+  color: #ff6b6b;
+  font-style: normal;
+}
 /* Bubbles that contain a (non-image) file attachment: keep ticks tucked at right */
 .bubble:has(> .attachment > .file) > .meta {
   position: absolute;

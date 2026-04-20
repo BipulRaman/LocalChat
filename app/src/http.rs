@@ -351,19 +351,20 @@ async fn upload(
     // for any non-WS caller). The WS client always supplies one now.
     let user_id = session
         .as_deref()
-        .and_then(|t| state.sessions.get(t).map(|e| *e.value()));
+        .and_then(|t| state.sessions.get(t).map(|e| e.value().clone()));
 
     // Always record the upload in the durable index for the admin
     // dashboard, regardless of whether a message was created.
     let uploaded_by_name = user_id
-        .and_then(|uid| state.users.get(&uid).map(|u| u.username.to_string()))
+        .as_ref()
+        .and_then(|uid| state.users.get(uid).map(|u| u.username.to_string()))
         .unwrap_or_default();
     let _ = state.db.insert_upload(
         &info.filename,
         &info.original_name,
         info.mime_type.as_str(),
         file_size,
-        user_id,
+        user_id.clone(),
         &uploaded_by_name,
         now_secs(),
     ).await;
@@ -408,7 +409,7 @@ async fn upload(
         id: state.next_msg_id(),
         channel: ch_id.to_compact_string(),
         kind: MsgKind::File,
-        user_id: uid,
+        user_id: uid.clone(),
         username: user.username.clone(),
         avatar: user.avatar.clone(),
         color: user.color.clone(),
@@ -498,7 +499,7 @@ async fn serve_upload(
             }
             headers.insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400"),
+                HeaderValue::from_static("no-store, must-revalidate"),
             );
             (StatusCode::OK, headers, bytes).into_response()
         }

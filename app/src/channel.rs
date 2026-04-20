@@ -88,8 +88,8 @@ impl Channel {
             kind: self.kind,
             name: self.name.clone(),
             is_private: self.is_private,
-            members: self.members.iter().map(|e| *e).collect(),
-            created_by: self.created_by,
+            members: self.members.iter().map(|e| e.clone()).collect(),
+            created_by: self.created_by.clone(),
             created_at: self.created_at,
             dm_users: self.dm_users.clone(),
         }
@@ -131,7 +131,7 @@ impl ChannelRegistry {
             ChannelKind::Lobby,
             CompactString::const_new(LOBBY_NAME),
             false,
-            0,
+            CompactString::const_new(""),
             history_cap,
         );
         this.map
@@ -157,10 +157,10 @@ impl ChannelRegistry {
             ChannelKind::Group,
             name.chars().take(40).collect::<String>().to_compact_string(),
             is_private,
-            created_by,
+            created_by.clone(),
             self.history_cap,
         ));
-        ch.members.insert(created_by);
+        ch.members.insert(created_by.clone());
         self.map.insert(id.clone(), Arc::clone(&ch));
         self.add_user_channel(created_by, &id);
         ch
@@ -190,8 +190,8 @@ impl ChannelRegistry {
         let id = Self::dm_id_for_names(a_name, b_name);
         if let Some(c) = self.get(&id) {
             // Refresh members in case either side is reconnecting.
-            c.members.insert(a_id);
-            c.members.insert(b_id);
+            c.members.insert(a_id.clone());
+            c.members.insert(b_id.clone());
             self.add_user_channel(a_id, &c.id);
             self.add_user_channel(b_id, &c.id);
             return c;
@@ -204,13 +204,13 @@ impl ChannelRegistry {
             ChannelKind::Dm,
             CompactString::const_new(""),
             true,
-            a_id,
+            a_id.clone(),
             self.history_cap,
         );
         ch.dm_users = Some(names);
         let ch = Arc::new(ch);
-        ch.members.insert(a_id);
-        ch.members.insert(b_id);
+        ch.members.insert(a_id.clone());
+        ch.members.insert(b_id.clone());
         self.map.insert(id.clone(), Arc::clone(&ch));
         self.add_user_channel(a_id, &id);
         self.add_user_channel(b_id, &id);
@@ -226,8 +226,8 @@ impl ChannelRegistry {
             let ch = entry.value();
             if let Some(names) = &ch.dm_users {
                 if names.iter().any(|n| n.to_lowercase() == lname) {
-                    ch.members.insert(user_id);
-                    self.add_user_channel(user_id, &ch.id);
+                    ch.members.insert(user_id.clone());
+                    self.add_user_channel(user_id.clone(), &ch.id);
                     out.push(ch.id.clone());
                 }
             }
@@ -254,9 +254,9 @@ impl ChannelRegistry {
     pub fn delete_dm(&self, id: &str) -> Vec<UserId> {
         let Some(ch) = self.get(id) else { return Vec::new(); };
         if !matches!(ch.kind, ChannelKind::Dm) { return Vec::new(); }
-        let members: Vec<UserId> = ch.members.iter().map(|e| *e).collect();
+        let members: Vec<UserId> = ch.members.iter().map(|e| e.clone()).collect();
         for uid in &members {
-            self.remove_user_channel(*uid, id);
+            self.remove_user_channel(uid.clone(), id);
         }
         self.map.remove(id);
         members
@@ -268,9 +268,9 @@ impl ChannelRegistry {
     pub fn delete_any(&self, id: &str) -> Option<Vec<UserId>> {
         let ch = self.get(id)?;
         if matches!(ch.kind, ChannelKind::Lobby) { return None; }
-        let members: Vec<UserId> = ch.members.iter().map(|e| *e).collect();
+        let members: Vec<UserId> = ch.members.iter().map(|e| e.clone()).collect();
         for uid in &members {
-            self.remove_user_channel(*uid, id);
+            self.remove_user_channel(uid.clone(), id);
         }
         self.map.remove(id);
         Some(members)
@@ -320,7 +320,7 @@ impl ChannelRegistry {
             ch.dm_users = m.dm_users;
             let ch = Arc::new(ch);
             for uid in &m.members {
-                ch.members.insert(*uid);
+                ch.members.insert(uid.clone());
             }
             self.map.insert(m.id.clone(), ch);
         }

@@ -1,9 +1,19 @@
-//! Users: lightweight records, addressed by numeric IDs.
+//! Users: lightweight records, addressed by stable UUID strings.
+//!
+//! Using a server-issued UUID (instead of a sequential u32) means a
+//! returning client can present its old id from localStorage and the
+//! server can match it against the persisted pubkey to refuse
+//! impersonation. UUIDs are also unguessable, so a malicious peer
+//! can't forge a `userId` field on the wire and pretend to be user #5.
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
-pub type UserId = u32;
+/// Server-issued, opaque, stable per-user identifier. Generated as
+/// `uuid::Uuid::new_v4().simple()` (32 hex chars, no dashes) on first
+/// join and persisted in the `users` table forever. Clients echo it
+/// back on every reconnect.
+pub type UserId = CompactString;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
