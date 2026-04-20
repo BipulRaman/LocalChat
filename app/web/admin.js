@@ -139,6 +139,52 @@ function confirmDialog({ title = "Confirm", body = "", okText = "OK", okClass = 
   });
 }
 
+// One-time display of an admin-issued temporary password. The string
+// is only ever returned once by the server, so make it easy to copy
+// before the dialog is dismissed.
+function showTempPasswordDialog(username, password) {
+  const root = $("adModal");
+  root.classList.remove("hidden");
+  const close = () => { root.classList.add("hidden"); root.replaceChildren(); };
+  const pwInput = el("input", {
+    class: "ad-input",
+    type: "text",
+    readonly: true,
+    value: password,
+    style: "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.1em;letter-spacing:.05em;",
+    onclick: (e) => e.target.select(),
+  });
+  const copyBtn = el("button", {
+    class: "btn btn-primary", type: "button",
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(password);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
+      } catch {
+        pwInput.select();
+        document.execCommand?.("copy");
+      }
+    },
+  }, "Copy");
+  const panel = el("div", { class: "ad-modal-panel", role: "document" }, [
+    el("h3", { class: "ad-modal-title" }, "Temporary password for " + username),
+    el("div", { class: "ad-modal-body" }, [
+      el("p", null, "Share this password with the user privately. They will be signed out and must use it to log in, then choose a new password."),
+      el("p", { class: "muted xs" }, "This is the only time the password is shown."),
+      el("div", { style: "display:flex;gap:8px;align-items:stretch;margin-top:8px;" }, [
+        pwInput, copyBtn,
+      ]),
+    ]),
+    el("div", { class: "ad-modal-foot" }, [
+      el("button", { class: "btn btn-primary", type: "button", onclick: close }, "Done"),
+    ]),
+  ]);
+  root.replaceChildren(panel);
+  root.onclick = (e) => { if (e.target === root) close(); };
+  setTimeout(() => pwInput.focus(), 30);
+}
+
 // ─── Top-level orchestrator ─────────────────────────────────────────
 async function refreshAll() {
   try {
@@ -403,6 +449,19 @@ function userRow(u) {
         try { await api(`/kick/${u.id}`, { method: "POST" }); toast("Kicked " + u.username); refreshAll(); }
         catch (err) { toast("Error: " + err.message); }
       } }, "Kick") : null,
+      el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: async () => {
+        const ok = await confirmDialog({
+          title: "Reset password?",
+          body: `Reset the password for ${u.username}?\n\nA new temporary password will be generated. ${u.username} will be signed out and must use the temporary password to log in, then choose a new one.`,
+          okText: "Reset password", okClass: "btn-primary",
+        });
+        if (!ok) return;
+        try {
+          const res = await api(`/reset-password/${u.id}`, { method: "POST" });
+          showTempPasswordDialog(u.username, res.tempPassword);
+          refreshAll();
+        } catch (err) { toast("Error: " + err.message); }
+      } }, "Reset password"),
       el("button", { class: "btn btn-danger btn-sm", type: "button", onclick: async () => {
         const ok = await confirmDialog({
           title: "Ban user?",

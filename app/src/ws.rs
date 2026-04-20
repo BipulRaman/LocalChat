@@ -36,7 +36,7 @@ enum PasswordAction {
 
 /// Argon2id over the supplied password with a fresh random salt.
 /// Returns the PHC-formatted string ready for storage.
-fn hash_password(plain: &str) -> Option<String> {
+pub(crate) fn hash_password(plain: &str) -> Option<String> {
     use argon2::{Argon2, PasswordHasher};
     use password_hash::{rand_core::OsRng, SaltString};
     let salt = SaltString::generate(&mut OsRng);
@@ -160,8 +160,9 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
     // behind.
     let mut password_action: PasswordAction = PasswordAction::None;
     let mut forced_user_id: Option<UserId> = None;
+    let mut must_change_password = false;
     match stored.as_ref() {
-        Some((existing_id, hash)) if !hash.is_empty() => {
+        Some((existing_id, hash, must_change)) if !hash.is_empty() => {
             if !verify_password(&join.password, hash) {
                 let _ = sink
                     .send(Message::Text(
@@ -179,8 +180,9 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
             // the browser sent in `userId`. This is what lets the same
             // account log in from a brand-new browser.
             forced_user_id = Some(existing_id.clone());
+            must_change_password = *must_change;
         }
-        Some((existing_id, _)) => {
+        Some((existing_id, _, _)) => {
             // Row exists but never had a password \u2014 first password is
             // accepted as the new credential.
             if join.password.len() < 4 {
@@ -326,7 +328,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
                     PasswordAction::SetForExisting(id) => id.clone(),
                     _ => user_id.clone(),
                 };
-                let _ = state.db.set_password_hash(target_id, &hash).await;
+                let _ = state.db.set_password_hash(target_id, &hash, false).await;
             }
         }
         PasswordAction::None => {}
@@ -385,6 +387,7 @@ pub async fn handle(socket: WebSocket, state: Arc<AppState>, peer_ip: String, us
         "users": state.users.iter().map(|e| e.value().clone()).collect::<Vec<_>>(),
         "lobby": LOBBY_ID,
         "session": session_token,
+        "mustChangePassword": must_change_password,
     });
     if sink.send(Message::Text(welcome.to_string())).await.is_err() {
         // Session token is intentionally NOT removed on disconnect:
@@ -1391,6 +1394,52 @@ async fn handle_op(
 
         "ping" => {
             let _ = sink.send(Message::Text(r#"{"ev":"pong"}"#.into())).await;
+        }
+
+        "change_password" => {
+            let current = v.get("current").and_then(Value::as_str).unwrap_or("");
+            let new_pw = v.get("new").and_then(Value::as_str).unwrap_or("");
+            if new_pw.len() < 4 || new_pw.len() > 256 {
+                let _ = sink.send(Message::Text(json!({
+                    "ev":"error",
+                    "code":"password_weak",
+                    "text":"New password must be 4-256 characters.",
+                }).to_string())).await;
+                return Ok(());
+            }
+            // Look up the user's current hash by username so we can verify.
+            let username = state.users.get(&user_id).map(|u| u.username.to_string()).unwrap_or_default();
+            let stored = state.db.find_user_credentials(&username).await.ok().flatten();
+            let Some((_, hash, _)) = stored else {
+                let _ = sink.send(Message::Text(json!({
+                    "ev":"error","code":"bad_password","text":"Account not found."
+                }).to_string())).await;
+                return Ok(());
+            };
+            // If the row already has a hash, verify the current password.
+            // (It always should at this point, but be defensive.)
+            if !hash.is_empty() && !verify_password(current, &hash) {
+                let _ = sink.send(Message::Text(json!({
+                    "ev":"error","code":"bad_password","text":"Current password is incorrect."
+                }).to_string())).await;
+                return Ok(());
+            }
+            let Some(new_hash) = hash_password(new_pw) else {
+                let _ = sink.send(Message::Text(json!({
+                    "ev":"error","text":"Failed to hash password."
+                }).to_string())).await;
+                return Ok(());
+            };
+            if let Err(e) = state.db.set_password_hash(user_id.clone(), &new_hash, false).await {
+                crate::applog::log(format_args!("set_password_hash FAILED: {e}"));
+                let _ = sink.send(Message::Text(json!({
+                    "ev":"error","text":"Failed to save password."
+                }).to_string())).await;
+                return Ok(());
+            }
+            let _ = sink.send(Message::Text(json!({
+                "ev":"password_changed",
+            }).to_string())).await;
         }
 
         "call_signal" => {

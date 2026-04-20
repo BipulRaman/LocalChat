@@ -503,6 +503,7 @@ function handleEvent(e) {
     case "kicked":       return onKicked(e);
     case "error":        return onError(e);
     case "pong":         return;
+    case "password_changed": return onPasswordChanged();
     default:             console.debug("[ev]", e);
   }
 }
@@ -564,6 +565,19 @@ function onError(e) {
     try { S.ws && S.ws.close(); } catch {}
     return;
   }
+  // If the change-password modal is open, surface the error inline
+  // instead of as a generic toast.
+  const cpwModal = $("changePwModal");
+  if (cpwModal && !cpwModal.classList.contains("hidden") &&
+      (e.code === "bad_password" || e.code === "password_weak")) {
+    const status = $("cpwStatus");
+    if (status) {
+      status.textContent = e.text || "Password change failed.";
+      status.classList.add("err");
+      status.classList.remove("ok");
+    }
+    return;
+  }
   toast(e.text || "Server error");
 }
 
@@ -603,6 +617,11 @@ function onWelcome(e) {
       onclick: toggleTheme,
     }),
     el("button", {
+      class: "icon-btn", title: "Change password", "aria-label": "Change password",
+      onclick: () => openChangePasswordModal({ forced: false }),
+      html: `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 8V7a3 3 0 016 0v3H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>`,
+    }),
+    el("button", {
       class: "icon-btn", title: "Sign out", "aria-label": "Sign out",
       onclick: signOut,
       html: `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M15 17l5-5-5-5M20 12H9M12 19H5a2 2 0 01-2-2V7a2 2 0 012-2h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
@@ -615,6 +634,9 @@ function onWelcome(e) {
   renderMembers();
   switchChannel(e.lobby || "pub:general");
   S.lobby = e.lobby || "pub:general";
+  if (e.mustChangePassword) {
+    setTimeout(() => openChangePasswordModal({ forced: true }), 200);
+  }
 }
 
 function onUsers(list) {
@@ -2206,6 +2228,68 @@ function signOut() {
   location.reload();
 }
 
+// ── Change password ─────────────────────────────────────────────────
+let _cpwForced = false;
+function openChangePasswordModal({ forced } = {}) {
+  _cpwForced = !!forced;
+  const intro = $("cpwIntro");
+  const closeBtn = $("cpwClose");
+  const cancelBtn = $("cpwCancel");
+  if (intro) {
+    intro.textContent = forced
+      ? "An administrator has reset your password. Enter the temporary password and choose a new one to continue."
+      : "Update the password you use to log in from any browser.";
+  }
+  if (closeBtn) closeBtn.style.display = forced ? "none" : "";
+  if (cancelBtn) cancelBtn.style.display = forced ? "none" : "";
+  $("cpwCurrent").value = "";
+  $("cpwNew").value = "";
+  $("cpwConfirm").value = "";
+  $("cpwStatus").textContent = "";
+  $("cpwStatus").classList.remove("err", "ok");
+  openModal("changePwModal");
+  setTimeout(() => $("cpwCurrent").focus(), 30);
+}
+
+function submitChangePassword(ev) {
+  ev.preventDefault();
+  const cur = $("cpwCurrent").value;
+  const next = $("cpwNew").value;
+  const conf = $("cpwConfirm").value;
+  const status = $("cpwStatus");
+  status.classList.remove("err", "ok");
+  if (next.length < 4) {
+    status.textContent = "New password must be at least 4 characters.";
+    status.classList.add("err"); return;
+  }
+  if (next !== conf) {
+    status.textContent = "New passwords do not match.";
+    status.classList.add("err"); return;
+  }
+  if (next === cur) {
+    status.textContent = "New password must differ from the current one.";
+    status.classList.add("err"); return;
+  }
+  if (!S.ws || S.ws.readyState !== WebSocket.OPEN) {
+    status.textContent = "Not connected. Try again in a moment.";
+    status.classList.add("err"); return;
+  }
+  status.textContent = "Saving…";
+  try { S.ws.send(JSON.stringify({ op: "change_password", current: cur, new: next })); }
+  catch { status.textContent = "Failed to send."; status.classList.add("err"); }
+}
+
+function onPasswordChanged() {
+  const status = $("cpwStatus");
+  if (status) {
+    status.textContent = "Password updated.";
+    status.classList.remove("err");
+    status.classList.add("ok");
+  }
+  toast("Password changed.");
+  setTimeout(() => closeModal("changePwModal"), 700);
+}
+
 // ── Lightbox ─────────────────────────────────────────────────────────
 function openLightbox(src, name, downloadUrl) {
   closeLightbox();
@@ -2454,7 +2538,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 // expose for inline onclick handlers
-Object.assign(window, { openCreateChannel, openDmPicker, closeModal, openModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker, toggleCamera });
+Object.assign(window, { openCreateChannel, openDmPicker, closeModal, openModal, createChannel, toggleSidebar, toggleTheme, startCall, acceptCall, declineCall, endCall, toggleMute, toggleSpeaker, toggleCamera, openChangePasswordModal, submitChangePassword });
 
 // ── Theme ────────────────────────────────────────────────────────────
 function toggleTheme() {

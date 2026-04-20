@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS users (
     color           TEXT    NOT NULL DEFAULT '',
     pubkey          TEXT    NOT NULL DEFAULT '',
     password_hash   TEXT    NOT NULL DEFAULT '',
+    must_change_password INTEGER NOT NULL DEFAULT 0,
     joined_at       INTEGER NOT NULL,
     last_connect    INTEGER NOT NULL DEFAULT 0,
     last_seen       INTEGER NOT NULL DEFAULT 0,
@@ -206,6 +207,7 @@ impl Db {
             // create-table SQL above already includes them, but
             // older installs won't have re-run it).
             let _ = conn.execute("ALTER TABLE messages ADD COLUMN client_id TEXT", []);
+            let _ = conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0", []);
             let _ = conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(client_id) WHERE client_id IS NOT NULL",
                 [],
@@ -453,21 +455,25 @@ impl Db {
         .await
     }
 
-    /// Look up `(id, password_hash)` for a username (case-insensitive).
+    /// Look up `(id, password_hash, must_change_password)` for a username (case-insensitive).
     /// Returns `None` when the username has never been registered.
     /// `password_hash` is empty string for legacy rows that predate
     /// the password feature.
     pub async fn find_user_credentials(
         &self,
         username: &str,
-    ) -> rusqlite::Result<Option<(UserId, String)>> {
+    ) -> rusqlite::Result<Option<(UserId, String, bool)>> {
         let key = username.to_lowercase();
         self.with(move |c| {
             let row = c
                 .query_row(
-                    "SELECT id, password_hash FROM users WHERE username_lower = ?1",
+                    "SELECT id, password_hash, must_change_password FROM users WHERE username_lower = ?1",
                     params![key],
-                    |r| Ok((r.get::<_, String>(0)?.to_compact_string(), r.get::<_, String>(1)?)),
+                    |r| Ok((
+                        r.get::<_, String>(0)?.to_compact_string(),
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    )),
                 )
                 .optional()?;
             Ok(row)
@@ -476,17 +482,21 @@ impl Db {
     }
 
     /// Persist a freshly computed password hash for `user_id`.
+    /// `must_change` flags the user to be forced into a change-password
+    /// flow on their next successful login (used by admin resets).
     pub async fn set_password_hash(
         &self,
         user_id: UserId,
         hash: &str,
+        must_change: bool,
     ) -> rusqlite::Result<()> {
         let id = user_id.to_string();
         let hash = hash.to_string();
+        let flag: i64 = if must_change { 1 } else { 0 };
         self.with(move |c| {
             c.execute(
-                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
-                params![hash, id],
+                "UPDATE users SET password_hash = ?1, must_change_password = ?2 WHERE id = ?3",
+                params![hash, flag, id],
             )?;
             Ok(())
         })

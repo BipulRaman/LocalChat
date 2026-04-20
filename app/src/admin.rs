@@ -25,6 +25,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/kick/:user_id", post(kick))
         .route("/ban/:user_id", post(ban))
         .route("/unban/:username", post(unban))
+        .route("/reset-password/:user_id", post(reset_password))
         .route("/broadcast", post(broadcast))
         .route("/channel/:id", axum::routing::delete(delete_channel))
         .route("/uploads", get(list_uploads))
@@ -264,6 +265,66 @@ async fn kick(
     let _ = state.db.delete_user(user_id.clone()).await;
     let _ = state.db.log_admin("kick", &addr.ip().to_string(), &user_id, "").await;
     Ok(Json(json!({"ok": existed})))
+}
+
+/// Generate a temporary password for the target user, replace their
+/// stored hash with it, and force them to choose a new password on
+/// their next successful login. The temp password is returned to the
+/// admin in the response (one-time view) so they can hand it over
+/// out-of-band. Also disconnects every live socket for the user so
+/// the next reconnect runs the change-password flow.
+async fn reset_password(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth!(state, headers, addr);
+    let user_id = user_id.to_compact_string();
+    // Resolve a username for the response (best-effort \u2014 used for
+    // the toast message in the admin UI).
+    let username = state
+        .users
+        .get(&user_id)
+        .map(|u| u.username.to_string())
+        .or_else(|| state.known_users.get(&user_id).map(|u| u.username.to_string()))
+        .unwrap_or_default();
+    if username.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "no such user".into()));
+    }
+    let temp_pw = generate_temp_password();
+    let Some(hash) = crate::ws::hash_password(&temp_pw) else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "hash failed".into()));
+    };
+    state
+        .db
+        .set_password_hash(user_id.clone(), &hash, true)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Boot any live sockets so the user is forced through the new
+    // login + change-password flow.
+    let _ = state.kick_tx.send(crate::state::KickSignal::User(user_id.clone()));
+    let _ = state
+        .db
+        .log_admin("reset_password", &addr.ip().to_string(), &user_id, "")
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "username": username,
+        "tempPassword": temp_pw,
+    })))
+}
+
+/// 12-character password drawn from an unambiguous alphabet so it's
+/// safe to read aloud or paste into a chat. We bias toward letters +
+/// digits and skip easily-confused glyphs (0/O, 1/l/I).
+fn generate_temp_password() -> String {
+    use rand::seq::SliceRandom;
+    const ALPHA: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| *ALPHA.choose(&mut rng).unwrap() as char)
+        .collect()
 }
 
 async fn ban(
